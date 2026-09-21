@@ -553,6 +553,16 @@
       color-scheme: dark; cursor: pointer;
     }
     .dl-format-select:focus { border-color: var(--gold-border); }
+    /* Daftar pilihan (dropdown) memakai background SOLID -- var(--surface) itu
+       putih transparan, jadi di popup native browser tampil putih dengan teks
+       terang (tidak terbaca). */
+    .dl-format-select option {
+      background-color: #1b2130; color: #f2f4f8;
+    }
+    .dl-format-select option:checked,
+    .dl-format-select option:hover {
+      background-color: #3a4a6b; color: #ffffff;
+    }
 
     /* ---- Mobile: tabel jadi kartu ---- */
     @media (max-width: 760px) {
