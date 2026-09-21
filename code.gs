@@ -740,9 +740,14 @@ function generateActiveRow_BBPercepatan() {
     return;
   }
   const kepadaValue = sheet.getRange(row, BBPERCEPATAN.COL.NAMA_MITRA_PT_CV).getValue();
-  const label = mitraValue + (kepadaValue ? ' - ' + kepadaValue : '');
-  const groupKey = String(mitraValue).trim() + '||' + String(kepadaValue).trim().toUpperCase();
-  const ok = generateBBPercepatanForGroup_(sheet, BBPERCEPATAN, groupKey);
+  const group = findBBPercepatanGroupByRow_(sheet, BBPERCEPATAN, row);
+  if (!group) {
+    SpreadsheetApp.getUi().alert('Baris ' + row + ' tidak ditemukan dalam daftar dokumen BB Percepatan.');
+    return;
+  }
+  const label = mitraValue + (kepadaValue ? ' - ' + kepadaValue : '') +
+    (group.firstNoSpk ? ' (SPK ' + group.firstNoSpk + ')' : '');
+  const ok = generateBBPercepatanForGroup_(sheet, BBPERCEPATAN, group.key);
   if (ok === true) {
     invalidateDocsCache_();
     SpreadsheetApp.getUi().alert('Dokumen berhasil dibuat untuk mitra pembangunan "' + label + '".');
@@ -770,8 +775,7 @@ function generateAllMissing_BBPercepatan() {
   let count = 0;
   groups.forEach(function (group) {
     if (!group.isComplete) return;
-    const fileName = buildBBPercepatanFileName_(group);
-    if (wordMap[fileName]) return; // sudah ada -> lewati
+    if (lookupBBPercepatanFiles_(group, wordMap, {}).wordFile) return; // sudah ada -> lewati
     const ok = generateBBPercepatanForGroup_(sheet, BBPERCEPATAN, group.key);
     if (ok === true) count++;
   });
@@ -1037,12 +1041,23 @@ function generateForRow(sheet, row, config) {
 // mewakili banyak baris, bukan satu baris seperti config lainnya.
 // ======================================================================
 
-// Kumpulkan seluruh baris tab BB Percepatan menjadi grup per nilai
-// MITRA PEMBANGUNAN (kolom A). Setiap grup berisi daftar SEGMENT &
-// STASIUN (sejajar per baris) plus data KEPADA/DIREKSI/ALAMAT yang
-// diambil dari baris PERTAMA pada grup tersebut — pastikan baris-baris
-// dengan MITRA PEMBANGUNAN yang sama juga konsisten nilai KEPADA/
-// DIREKSI/ALAMAT-nya di sheet.
+// Kumpulkan seluruh baris tab BB Percepatan menjadi DOKUMEN-DOKUMEN (grup).
+//
+// Aturan pengelompokan (2 tahap):
+//  1. Baris dikelompokkan dulu per MITRA: MITRA PEMBANGUNAN (kolom A) +
+//     mitra pelaksana / NAMA MITRA PAKAI PT/CV (kolom J).
+//  2. Di dalam 1 mitra, baris DIPECAH lagi jadi dokumen terpisah berdasarkan
+//     NOMOR SPK: baris-baris hanya digabung jadi 1 dokumen kalau mereka
+//     berbagi nomor SPK yang sama (SURVEY / PATCHING / HC) -- itulah kasus
+//     "1 SPK payung untuk beberapa STASIUN". Baris dengan nomor SPK yang
+//     sama sekali beda dianggap PENGAJUAN BARU -> dokumen sendiri.
+//
+// Sebelumnya cuma tahap 1, sehingga baris baru untuk mitra yang sama
+// (dengan nomor SPK baru) ikut menyatu dengan dokumen yang sudah dibuat.
+// Baris yang belum punya nomor SPK sama sekali dikumpulkan jadi 1 dokumen
+// "TANPA NO SPK" per mitra (sampai nomornya diisi).
+//
+// Data KEPADA/DIREKSI/ALAMAT diambil dari baris PERTAMA pada tiap dokumen.
 function buildBBPercepatanGroups_(sheet, config) {
   const lastRow = sheet.getLastRow();
   if (lastRow < FIRST_DATA_ROW) return [];
@@ -1054,71 +1069,182 @@ function buildBBPercepatanGroups_(sheet, config) {
   const COL = config.COL;
   const get = function (row, colIndex) { return colIndex ? row[colIndex - 1] : ''; };
 
-  const groupsByKey = {};
-  const order = [];
+  // ---- Tahap 1: kelompokkan per mitra ----
+  const rowsByMitra = {};
+  const mitraOrder = [];
 
   values.forEach(function (row, idx) {
-    const rowNumber = FIRST_DATA_ROW + idx;
     const mitraPembangunan = get(row, COL.MITRA_PEMBANGUNAN);
     if (!mitraPembangunan) return; // baris kosong / bukan data -> lewati
     const kepadaRow = get(row, COL.NAMA_MITRA_PT_CV);
-
-    // Kunci grup = MITRA PEMBANGUNAN (FAMIKA/KOPINDOSAT) + mitra pelaksana
-    // sebenarnya (NAMA MITRA PAKAI PT/CV). Kalau cuma pakai MITRA
-    // PEMBANGUNAN saja, baris dari mitra pelaksana yang beda tapi sama-sama
-    // "FAMIKA" akan tercampur jadi 1 dokumen -- itu bug yang mau diperbaiki.
-    const key = String(mitraPembangunan).trim() + '||' + String(kepadaRow).trim().toUpperCase();
-    if (!groupsByKey[key]) {
-      groupsByKey[key] = {
-        key: key,
-        mitraPembangunan: mitraPembangunan,
-        region: get(row, COL.REGION),
-        kepada: kepadaRow,
-        direksi: get(row, COL.DIREKSI),
-        alamat: get(row, COL.ALAMAT),
-        mitraLama: get(row, COL.MITRA_LAMA),
-        mitraPengganti: get(row, COL.MITRA_PENGGANTI),
-        rows: [],
-        rowNumbers: []
-      };
-      order.push(key);
+    const mitraKey = String(mitraPembangunan).trim() + '||' + String(kepadaRow).trim().toUpperCase();
+    if (!rowsByMitra[mitraKey]) {
+      rowsByMitra[mitraKey] = [];
+      mitraOrder.push(mitraKey);
     }
-    const group = groupsByKey[key];
-    group.rows.push({
+    rowsByMitra[mitraKey].push({
+      rowNumber: FIRST_DATA_ROW + idx,
+      mitraPembangunan: mitraPembangunan,
+      region: get(row, COL.REGION),
+      kepada: kepadaRow,
+      direksi: get(row, COL.DIREKSI),
+      alamat: get(row, COL.ALAMAT),
+      mitraLama: get(row, COL.MITRA_LAMA),
+      mitraPengganti: get(row, COL.MITRA_PENGGANTI),
       segment: get(row, COL.SEGMENT),
       stasiun: get(row, COL.STASIUN),
       noSpkSurvey: get(row, COL.NO_SPK_SURVEY),
       noSpkPatching: get(row, COL.NO_SPK_PATCHING),
-      noSpkHc: get(row, COL.NO_SPK_HC),
-      rowNumber: rowNumber
+      noSpkHc: get(row, COL.NO_SPK_HC)
     });
-    group.rowNumbers.push(rowNumber);
   });
 
-  return order.map(function (key) {
-    const g = groupsByKey[key];
-    const hasSegmentStasiun = g.rows.some(function (r) { return r.segment && r.stasiun; });
-    g.isComplete = !!(g.kepada && g.direksi && g.alamat && hasSegmentStasiun);
-    return g;
+  // ---- Tahap 2: pecah tiap mitra per keluarga nomor SPK ----
+  const groups = [];
+  mitraOrder.forEach(function (mitraKey) {
+    clusterRowsBySpk_(rowsByMitra[mitraKey]).forEach(function (cluster, clusterIdx) {
+      const first = cluster.rows[0];
+      const g = {
+        key: mitraKey + '||' + normalizeNoSpk_(cluster.firstNoSpk),
+        mitraKey: mitraKey,
+        firstNoSpk: cluster.firstNoSpk,
+        isFirstOfMitra: clusterIdx === 0, // dipakai utk mengenali file lama (tanpa suffix nomor SPK)
+        mitraPembangunan: first.mitraPembangunan,
+        region: first.region,
+        kepada: first.kepada,
+        direksi: first.direksi,
+        alamat: first.alamat,
+        mitraLama: first.mitraLama,
+        mitraPengganti: first.mitraPengganti,
+        rows: [],
+        rowNumbers: []
+      };
+      cluster.rows.forEach(function (r) {
+        g.rows.push({
+          segment: r.segment,
+          stasiun: r.stasiun,
+          noSpkSurvey: r.noSpkSurvey,
+          noSpkPatching: r.noSpkPatching,
+          noSpkHc: r.noSpkHc,
+          rowNumber: r.rowNumber
+        });
+        g.rowNumbers.push(r.rowNumber);
+      });
+      const hasSegmentStasiun = g.rows.some(function (r) { return r.segment && r.stasiun; });
+      g.isComplete = !!(g.kepada && g.direksi && g.alamat && hasSegmentStasiun);
+      groups.push(g);
+    });
+  });
+
+  return groups;
+}
+
+// Pecah daftar baris (yang sudah 1 mitra) jadi kelompok-kelompok yang
+// terhubung lewat nomor SPK yang SAMA (union-find). Dua baris masuk 1
+// kelompok kalau salah satu nomor SURVEY/PATCHING/HC-nya sama persis
+// (setelah dirapikan). Baris tanpa nomor SPK sama sekali digabung jadi 1
+// kelompok tersendiri. Urutan kelompok mengikuti urutan baris di sheet.
+function clusterRowsBySpk_(rows) {
+  const parent = rows.map(function (_, i) { return i; });
+  const find = function (i) {
+    while (parent[i] !== i) { parent[i] = parent[parent[i]]; i = parent[i]; }
+    return i;
+  };
+  const union = function (a, b) {
+    const ra = find(a), rb = find(b);
+    if (ra !== rb) parent[Math.max(ra, rb)] = Math.min(ra, rb);
+  };
+
+  const ownerByNumber = {};
+  let firstRowWithoutNumber = -1;
+  rows.forEach(function (r, i) {
+    let hasNumber = false;
+    [r.noSpkSurvey, r.noSpkPatching, r.noSpkHc].forEach(function (v) {
+      const n = normalizeNoSpk_(v);
+      if (!n) return;
+      hasNumber = true;
+      if (ownerByNumber[n] === undefined) ownerByNumber[n] = i;
+      else union(i, ownerByNumber[n]);
+    });
+    if (!hasNumber) {
+      if (firstRowWithoutNumber === -1) firstRowWithoutNumber = i;
+      else union(i, firstRowWithoutNumber);
+    }
+  });
+
+  const byRoot = {};
+  const order = [];
+  rows.forEach(function (r, i) {
+    const root = find(i);
+    if (!byRoot[root]) { byRoot[root] = []; order.push(root); }
+    byRoot[root].push(r);
+  });
+
+  return order.map(function (root) {
+    const list = byRoot[root];
+    let firstNoSpk = '';
+    for (let i = 0; i < list.length && !firstNoSpk; i++) {
+      const cands = [list[i].noSpkSurvey, list[i].noSpkPatching, list[i].noSpkHc]
+        .map(function (v) { return String(v === null || v === undefined ? '' : v).trim(); })
+        .filter(function (v) { return v !== ''; });
+      if (cands.length) firstNoSpk = cands[0];
+    }
+    return { rows: list, firstNoSpk: firstNoSpk };
   });
 }
 
 // Nama file HARUS SAMA PERSIS antara generateBBPercepatanForGroup_() dan
 // getDocumentsForBBPercepatan_() supaya dashboard bisa mendeteksi dokumen
-// yang sudah dibuat.
+// yang sudah dibuat. Sekarang ditambah NOMOR SPK di belakang nama, supaya
+// 2 dokumen untuk mitra yang sama (nomor SPK beda) tidak saling menimpa/
+// tertukar.
 function buildBBPercepatanFileName_(group) {
+  const spkPart = group.firstNoSpk
+    ? String(group.firstNoSpk).replace(/[\/\\]+/g, '-')
+    : 'TANPA NO SPK';
+  return buildBBPercepatanLegacyFileName_(group) + '_' + spkPart;
+}
+
+// Format nama file LAMA (sebelum ada suffix nomor SPK) -- hanya dipakai
+// untuk mengenali dokumen yang sudah terlanjur dibuat dengan format lama.
+function buildBBPercepatanLegacyFileName_(group) {
   return BBPERCEPATAN.FILE_PREFIX + '_' + group.mitraPembangunan + '_' + group.kepada;
 }
 
-// groupKeyValue = "MITRA_PEMBANGUNAN||NAMA_MITRA_PT_CV" (lihat
-// buildBBPercepatanGroups_). Dipakai di semua pemanggil (menu, onEdit,
-// dashboard) supaya mitra dengan nama sama tapi jenis beda tetap
-// ditemukan sebagai grup yang tepat, bukan tertukar.
+// Cari file Word/PDF milik 1 grup. Kalau file dengan nama baru belum ada,
+// dan grup ini adalah dokumen PERTAMA untuk mitra tsb, coba nama format
+// lama: dokumen lama itu dibuat sebelum ada baris-baris "baru", jadi paling
+// mungkin milik dokumen pertama. Dokumen berikutnya (nomor SPK baru) tidak
+// pernah dicocokkan ke nama lama -> otomatis tampil "Belum Dibuat".
+function lookupBBPercepatanFiles_(group, wordMap, pdfMap) {
+  const fileName = buildBBPercepatanFileName_(group);
+  let wordFile = wordMap[fileName] || null;
+  let pdfFile = pdfMap[fileName + '.pdf'] || null;
+  if (!wordFile && !pdfFile && group.isFirstOfMitra) {
+    const legacy = buildBBPercepatanLegacyFileName_(group);
+    wordFile = wordMap[legacy] || null;
+    pdfFile = pdfMap[legacy + '.pdf'] || null;
+  }
+  return { fileName: fileName, wordFile: wordFile, pdfFile: pdfFile };
+}
+
+// groupKeyValue = "MITRA_PEMBANGUNAN||NAMA_MITRA_PT_CV||NO_SPK_PERTAMA"
+// (lihat buildBBPercepatanGroups_). Dipakai di semua pemanggil (menu,
+// dashboard) supaya dokumen yang tepat yang ditemukan.
 function findBBPercepatanGroup_(sheet, config, groupKeyValue) {
   const groups = buildBBPercepatanGroups_(sheet, config);
   const key = String(groupKeyValue);
   for (let i = 0; i < groups.length; i++) {
     if (groups[i].key === key) return groups[i];
+  }
+  return null;
+}
+
+// Cari grup/dokumen yang memuat baris tertentu di sheet.
+function findBBPercepatanGroupByRow_(sheet, config, row) {
+  const groups = buildBBPercepatanGroups_(sheet, config);
+  for (let i = 0; i < groups.length; i++) {
+    if (groups[i].rowNumbers.indexOf(row) !== -1) return groups[i];
   }
   return null;
 }
@@ -1624,9 +1750,10 @@ function getDocumentsForBBPercepatan_(config, typeLabel) {
   groups.forEach(function (group) {
     if (!group.isComplete) return; // lewati grup yang datanya belum lengkap
 
-    const fileName = buildBBPercepatanFileName_(group);
-    const wordFile = wordMap[fileName] || null;
-    const pdfFile = pdfMap[fileName + '.pdf'] || null;
+    const found = lookupBBPercepatanFiles_(group, wordMap, pdfMap);
+    const fileName = found.fileName;
+    const wordFile = found.wordFile;
+    const pdfFile = found.pdfFile;
 
     const createdDateObj = wordFile ? wordFile.getDateCreated() : (pdfFile ? pdfFile.getDateCreated() : null);
     const createdDateText = createdDateObj ? Utilities.formatDate(createdDateObj, tz, 'dd MMM yyyy, HH:mm') : null;
@@ -2096,15 +2223,26 @@ function downloadSelectedZip(items, format) {
   };
 }
 
-// Jalankan SEKALI dari editor Apps Script (pilih fungsi ini -> Run) untuk
-// memberi izin "UrlFetchApp" yang dibutuhkan ekspor Word di atas, sekaligus
-// mengetes bahwa ekspor Word memang jalan. Ganti ID di bawah dengan ID
-// salah satu file Google Doc hasil generate (mis. dari folder Word Takeover).
+// Jalankan SEKALI dari editor Apps Script (pilih fungsi ini di dropdown ->
+// klik Run) untuk memberi izin "UrlFetchApp" (script.external_request) yang
+// dibutuhkan ekspor Word. Tidak perlu isi ID apa pun: fungsi ini otomatis
+// memakai Google Doc pertama yang ditemukan di folder Word Takeover.
+// Kalau muncul jendela "Authorization required" -> Review permissions ->
+// pilih akun -> Advanced -> Go to ... (unsafe) -> Allow.
+// Hasil tes bisa dilihat di Execution log: "Export Word OK ...".
 function tesExportWord() {
-  const FILE_ID = 'GANTI_DENGAN_ID_FILE_DOC_HASIL_GENERATE';
-  const f = DriveApp.getFileById(FILE_ID);
-  const blob = exportDocAsDocxBlob_(FILE_ID, f.getName());
-  Logger.log('Export Word OK: ' + blob.getName() + ' (' + blob.getBytes().length + ' bytes)');
+  const folders = [TAKEOVER, SPKNEW, EKSPAND, PEMBATALAN, BACANCEL, BBPERCEPATAN];
+  for (let i = 0; i < folders.length; i++) {
+    const it = DriveApp.getFolderById(folders[i].OUTPUT_FOLDER_WORD_ID).getFiles();
+    while (it.hasNext()) {
+      const f = it.next();
+      if (f.getMimeType() !== MimeType.GOOGLE_DOCS) continue;
+      const blob = exportDocAsDocxBlob_(f.getId(), f.getName());
+      Logger.log('Export Word OK: ' + blob.getName() + ' (' + blob.getBytes().length + ' bytes)');
+      return;
+    }
+  }
+  Logger.log('Izin sudah OK, tapi belum ada Google Doc hasil generate di folder Word untuk dites.');
 }
 
 function uniqueBlobName_(blob, usedNames) {
