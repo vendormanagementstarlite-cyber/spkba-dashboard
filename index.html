@@ -1131,7 +1131,13 @@
 
       callApiPost('downloadSelectedZip', { items: items, format: format }).then(function (res) {
         triggerBase64Download(res.base64, res.filename, res.mimeType);
-        showToast(items.length + ' dokumen berhasil disiapkan dalam ZIP.', 'success');
+        if (res.failed && res.failed.length) {
+          // Sebagian file gagal diambil -> jangan bilang "berhasil semua".
+          showToast((res.fileCount || 0) + ' file masuk ZIP, ' + res.failed.length + ' gagal: ' + res.failed[0], 'error');
+          console.warn('File gagal masuk ZIP:', res.failed);
+        } else {
+          showToast((res.fileCount || items.length) + ' file berhasil disiapkan dalam ZIP.', 'success');
+        }
         btn.disabled = false;
         btn.innerHTML = ICON_ZIP + ' Download ZIP';
       }).catch(function (err) {
