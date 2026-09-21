@@ -2000,6 +2000,46 @@ function deleteDashboardDocument(items) {
   return { successCount: successCount, failCount: failCount, messages: messages };
 }
 
+// ----------------------------------------------------------------------
+// Ekspor Google Doc -> file .docx (Word).
+// KENAPA TIDAK PAKAI DriveApp getAs(MimeType.MICROSOFT_WORD)?
+// Untuk Google Docs asli, DriveApp.getAs() HANYA mendukung konversi ke
+// PDF/gambar. Konversi ke Word melempar error "Converting from
+// application/vnd.google-apps.document to ...wordprocessingml.document
+// is not supported". Dulu error itu ditelan diam-diam (try/catch kosong),
+// jadi file Word tidak pernah masuk ke ZIP -- itu penyebab "save Word
+// tidak bisa" (PDF aman karena PDF diambil apa adanya lewat getBlob()).
+// Solusi: minta Google mengekspor Doc-nya sendiri lewat URL export
+// resmi memakai token OAuth script ini.
+// ----------------------------------------------------------------------
+function exportDocAsDocxBlob_(fileId, baseName) {
+  const token = ScriptApp.getOAuthToken();
+  const DOCX_MIME = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+  const urls = [
+    'https://docs.google.com/document/d/' + encodeURIComponent(fileId) + '/export?format=docx',
+    'https://www.googleapis.com/drive/v3/files/' + encodeURIComponent(fileId) + '/export?mimeType=' + encodeURIComponent(DOCX_MIME)
+  ];
+
+  let lastErr = '';
+  for (let i = 0; i < urls.length; i++) {
+    try {
+      const resp = UrlFetchApp.fetch(urls[i], {
+        headers: { Authorization: 'Bearer ' + token },
+        muteHttpExceptions: true,
+        followRedirects: true
+      });
+      const code = resp.getResponseCode();
+      if (code === 200) {
+        return resp.getBlob().setName(baseName + '.docx');
+      }
+      lastErr = 'HTTP ' + code + ' - ' + resp.getContentText().substring(0, 150);
+    } catch (err) {
+      lastErr = String(err);
+    }
+  }
+  throw new Error('Export Word gagal (' + lastErr + ')');
+}
+
 function downloadSelectedZip(items, format) {
   if (!items || items.length === 0) {
     throw new Error('Tidak ada dokumen yang dipilih.');
@@ -2008,28 +2048,39 @@ function downloadSelectedZip(items, format) {
 
   const blobs = [];
   const usedNames = {};
+  const failed = []; // pesan kegagalan per file -> dikirim balik ke dashboard
 
   items.forEach(function (item) {
     if ((format === 'word' || format === 'both') && item.wordFileId) {
+      let wordName = item.wordFileId;
       try {
         const wordFile = DriveApp.getFileById(item.wordFileId);
-        let blob = wordFile.getAs(MimeType.MICROSOFT_WORD); // Google Doc -> .docx
-        blob = uniqueBlobName_(blob, usedNames);
-        blobs.push(blob);
-      } catch (err) { /* lewati file yang gagal diambil */ }
+        wordName = wordFile.getName();
+        const blob = withRetry_(function () {
+          return exportDocAsDocxBlob_(item.wordFileId, wordName);
+        }, 2, 'export Word');
+        blobs.push(uniqueBlobName_(blob, usedNames));
+      } catch (err) {
+        failed.push('Word "' + wordName + '": ' + err);
+        Logger.log('downloadSelectedZip: gagal ambil Word ' + wordName + ' -> ' + err);
+      }
     }
     if ((format === 'pdf' || format === 'both') && item.pdfFileId) {
+      let pdfName = item.pdfFileId;
       try {
         const pdfFile = DriveApp.getFileById(item.pdfFileId);
-        let blob = pdfFile.getBlob();
-        blob = uniqueBlobName_(blob, usedNames);
-        blobs.push(blob);
-      } catch (err) { /* lewati file yang gagal diambil */ }
+        pdfName = pdfFile.getName();
+        blobs.push(uniqueBlobName_(pdfFile.getBlob(), usedNames));
+      } catch (err) {
+        failed.push('PDF "' + pdfName + '": ' + err);
+        Logger.log('downloadSelectedZip: gagal ambil PDF ' + pdfName + ' -> ' + err);
+      }
     }
   });
 
   if (blobs.length === 0) {
-    throw new Error('Tidak ada file yang berhasil diambil untuk di-zip.');
+    throw new Error('Tidak ada file yang berhasil diambil untuk di-zip.' +
+      (failed.length ? ' Penyebab: ' + failed[0] : ''));
   }
 
   const zipName = 'SPK_Dokumen_' +
@@ -2039,8 +2090,21 @@ function downloadSelectedZip(items, format) {
   return {
     base64: Utilities.base64Encode(zipBlob.getBytes()),
     filename: zipBlob.getName(),
-    mimeType: 'application/zip'
+    mimeType: 'application/zip',
+    fileCount: blobs.length,
+    failed: failed
   };
+}
+
+// Jalankan SEKALI dari editor Apps Script (pilih fungsi ini -> Run) untuk
+// memberi izin "UrlFetchApp" yang dibutuhkan ekspor Word di atas, sekaligus
+// mengetes bahwa ekspor Word memang jalan. Ganti ID di bawah dengan ID
+// salah satu file Google Doc hasil generate (mis. dari folder Word Takeover).
+function tesExportWord() {
+  const FILE_ID = 'GANTI_DENGAN_ID_FILE_DOC_HASIL_GENERATE';
+  const f = DriveApp.getFileById(FILE_ID);
+  const blob = exportDocAsDocxBlob_(FILE_ID, f.getName());
+  Logger.log('Export Word OK: ' + blob.getName() + ' (' + blob.getBytes().length + ' bytes)');
 }
 
 function uniqueBlobName_(blob, usedNames) {
