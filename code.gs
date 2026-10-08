@@ -64,6 +64,68 @@ function replaceAliasesMerged_(body, aliases, data, escapeRegex) {
 }
 
 
+// ----------------------------------------------------------------------
+// PLACEHOLDER TANGGAL — dipakai semua template.
+//   {{HARI SEKARANG}}      -> Jum'at
+//   {{TANGGAL SEKARANG}}   -> 25
+//   {{BULAN SEKARANG}}     -> September   (alias typo: {{BUAN SEKARANG}})
+//   {{TAHUN SEKARANG}}     -> 2026
+//   {{30 HARI SETELAH TANGGAL SEKARANG}} -> 25-Oktober-2026
+//     (hari ini + 30 hari kalender, format TANGGAL-BULAN-TAHUN supaya
+//      sejajar dengan "{{TANGGAL SEKARANG}}-{{BULAN SEKARANG}}-{{TAHUN SEKARANG}}"
+//      di kalimat masa berlaku SPK New & Ekspand)
+// Placeholder "30 HARI SETELAH ..." diganti PALING DULU supaya teks
+// "TANGGAL SEKARANG" di dalamnya tidak ikut tersentuh placeholder lain.
+// ----------------------------------------------------------------------
+const MASA_BERLAKU_SPK_HARI = 30;
+
+function fillDatePlaceholders_(body, escapeRegex) {
+  const HARI_ID = ['Senin', 'Selasa', 'Rabu', 'Kamis', "Jum'at", 'Sabtu', 'Minggu'];
+  const BULAN_ID = ['Januari', 'Februari', 'Maret', 'April', 'Mei', 'Juni',
+    'Juli', 'Agustus', 'September', 'Oktober', 'November', 'Desember'];
+  const tz = Session.getScriptTimeZone();
+  const now = new Date();
+  const later = new Date(now.getTime() + MASA_BERLAKU_SPK_HARI * 24 * 60 * 60 * 1000);
+
+  const fmtTanggal = function (d, sep) {
+    return Utilities.formatDate(d, tz, 'd') + sep +
+      BULAN_ID[Number(Utilities.formatDate(d, tz, 'M')) - 1] + sep +
+      Utilities.formatDate(d, tz, 'yyyy');
+  };
+
+  // Urutan penting: yang paling panjang/spesifik dulu.
+  const dateAliases = [
+    ['PLUS_30_HARI', ['30 HARI SETELAH TANGGAL SEKARANG', '30_HARI_SETELAH_TANGGAL_SEKARANG',
+      '30 HARI SETELAH TANGGAL', 'TANGGAL SEKARANG + 30 HARI', 'TANGGAL SEKARANG+30 HARI']],
+    ['HARI_SEKARANG', ['HARI SEKARANG', 'HARI_SEKARANG']],
+    ['TANGGAL_SEKARANG', ['TANGGAL SEKARANG', 'TANGGAL_SEKARANG']],
+    ['BULAN_SEKARANG', ['BULAN SEKARANG', 'BULAN_SEKARANG', 'BUAN SEKARANG']],
+    ['TAHUN_SEKARANG', ['TAHUN SEKARANG', 'TAHUN_SEKARANG']]
+  ];
+  const dateValues = {
+    PLUS_30_HARI: fmtTanggal(later, '-'),
+    HARI_SEKARANG: HARI_ID[Number(Utilities.formatDate(now, tz, 'u')) - 1],
+    TANGGAL_SEKARANG: Utilities.formatDate(now, tz, 'd'),
+    BULAN_SEKARANG: BULAN_ID[Number(Utilities.formatDate(now, tz, 'M')) - 1],
+    TAHUN_SEKARANG: Utilities.formatDate(now, tz, 'yyyy')
+  };
+  dateAliases.forEach(function (entry) {
+    const key = entry[0];
+    // \\s+ supaya tetap cocok walau di template ada spasi ganda/baris baru.
+    const patterns = entry[1].map(function (name) {
+      return '\\{\\{?\\s*' + escapeRegex(name).replace(/ /g, '\\s+') + '\\s*\\}?\\}';
+    });
+    body.replaceText('(?:' + patterns.join('|') + ')', String(dateValues[key]));
+  });
+
+  // Rekatkan "TANGGAL BULAN TAHUN" (mis. "2 September 2026") pakai spasi
+  // non-breaking, supaya Google Docs tidak memotongnya jadi 2 baris di
+  // paragraf tanda tangan yang sempit.
+  const gluedFrom = fmtTanggal(now, ' ');
+  body.replaceText(escapeRegex(gluedFrom), fmtTanggal(now, '\u00A0'));
+}
+
+
 const TAKEOVER = {
   SHEET_NAME: 'TEMPLATE TAKEOVER PDF WORD',
   TEMPLATE_ID: '16bOel7w5-Pz5jpdp7f7wqsT-yJKxCs-B3VvpOOgUtWg',
@@ -191,6 +253,34 @@ const BACANCEL = {
   FILE_PREFIX: 'BA CANCEL ONE ON ONE'
   // Tidak ada kolom output link di sheet ini, sama seperti SPK New/Ekspand/Pembatalan.
 };
+
+// ----------------------------------------------------------------------
+// KONFIGURASI G: SPK INNER CITY (tab "SPK INNER CITY")
+// Kolom sheet: A NAMA MITRA TANPA PT/CV | B REGION | C SITE | D HP |
+//              E NO SPK | F NAMA MITRA PAKAI PT/CV | G DIREKSI | H ALAMAT
+// "SITE" dipetakan ke STASIUN (placeholder {{SITE}} / {{STASIUN}} sama-sama jalan).
+// "HP" dipetakan ke HP_PENGAJUAN (placeholder {{HP}} / {{HP PENGAJUAN}}).
+// ----------------------------------------------------------------------
+const INNERCITY = {
+  SHEET_NAME: 'SPK INNER CITY',
+  TEMPLATE_ID: '1e692xGEipnbC1FhwhSWivZ1uLuUoX_mw1UBTgQvGRPk',
+  OUTPUT_FOLDER_WORD_ID: '1lqKOxfr8W8laSrv_ka3UUXmdAmAeghcz',
+  OUTPUT_FOLDER_PDF_ID: '1AQDYI6u8O9zgjPRJ9JxnL1nN-6QoMROQ',
+  COL: {
+    MITRA_TANPA_PTCV: 1, // A
+    REGION: 2,           // B
+    STASIUN: 3,          // C (SITE)
+    HP_PENGAJUAN: 4,     // D (HP)
+    NO_SPK: 5,           // E
+    NAMA_MITRA_PT_CV: 6, // F
+    DIREKSI: 7,          // G
+    ALAMAT: 8            // H
+  },
+  LAST_DATA_COL: 8,
+  FILE_PREFIX: 'SPK INNER CITY'
+  // Tidak ada kolom output link di sheet ini, sama seperti SPK New/Ekspand.
+};
+
 
 // ----------------------------------------------------------------------
 // KONFIGURASI E: BB PERCEPATAN (tab "TEMPLATE BB PERCEPATAN")
@@ -558,6 +648,10 @@ function onOpen() {
     .addItem('Generate baris ini (baris aktif)', 'generateActiveRow_Pembatalan')
     .addItem('Generate semua baris yang belum ada dokumen', 'generateAllMissing_Pembatalan')
     .addToUi();
+  ui.createMenu('SPK Inner City')
+    .addItem('Generate baris ini (baris aktif)', 'generateActiveRow_InnerCity')
+    .addItem('Generate semua baris yang belum ada dokumen', 'generateAllMissing_InnerCity')
+    .addToUi();
   ui.createMenu('BB Percepatan')
     .addItem('Generate mitra pembangunan aktif', 'generateActiveRow_BBPercepatan')
     .addItem('Generate semua mitra yang belum ada dokumen', 'generateAllMissing_BBPercepatan')
@@ -586,7 +680,7 @@ function setupTrigger() {
     .forSpreadsheet(ss)
     .onEdit()
     .create();
-  SpreadsheetApp.getUi().alert('Auto-generate aktif untuk kelima tab (Takeover, New, Ekspand, Pembatalan PO, & BB Percepatan).');
+  SpreadsheetApp.getUi().alert('Auto-generate aktif untuk semua tab (Takeover, New, Ekspand, Pembatalan PO, BA Cancel, Inner City, & BB Percepatan).');
 }
 
 // ----------------------------------------------------------------------
@@ -642,6 +736,9 @@ function onEditInstallable(e) {
     } else if (sheet.getName() === BACANCEL.SHEET_NAME) {
       if (editedCol > BACANCEL.LAST_DATA_COL) return;
       if (editedCol === BACANCEL.COL.NO_SPK) warnIfDuplicateNoSpkOnEdit_(sheet, row, BACANCEL.COL.NO_SPK, 'NO SPK');
+    } else if (sheet.getName() === INNERCITY.SHEET_NAME) {
+      if (editedCol > INNERCITY.LAST_DATA_COL) return;
+      if (editedCol === INNERCITY.COL.NO_SPK) warnIfDuplicateNoSpkOnEdit_(sheet, row, INNERCITY.COL.NO_SPK, 'NO SPK');
     } else if (sheet.getName() === BBPERCEPATAN.SHEET_NAME) {
       if (editedCol > BBPERCEPATAN.LAST_DATA_COL) return;
       if (editedCol === BBPERCEPATAN.COL.NO_SPK_SURVEY) warnIfDuplicateNoSpkOnEditBBPercepatan_(sheet, BBPERCEPATAN, row, BBPERCEPATAN.COL.NO_SPK_SURVEY, 'NO SPK SURVEY');
@@ -707,6 +804,16 @@ function generateActiveRow_BACancel() {
 }
 function generateAllMissing_BACancel() {
   runGenerateAllMissing(BACANCEL);
+}
+
+// ======================================================================
+// MENU MANUAL — SPK INNER CITY
+// ======================================================================
+function generateActiveRow_InnerCity() {
+  runGenerateActiveRow(INNERCITY);
+}
+function generateAllMissing_InnerCity() {
+  runGenerateAllMissing(INNERCITY);
 }
 
 // ======================================================================
@@ -926,7 +1033,7 @@ function generateForRow(sheet, row, config) {
     NO_SPK: ['NO_SPK', 'NO SPK'],
     KEPADA: ['KEPADA', 'NAMA MITRA PAKAI PT/CV'],
     NO_PO: ['NO_PO', 'NO PO', 'NOMOR PO'],
-    STASIUN: ['STASIUN'],
+    STASIUN: ['STASIUN', 'SITE'],
     REGION: ['REGION'],
     DIREKSI: ['DIREKSI'],
     ALAMAT: ['ALAMAT'],
@@ -934,7 +1041,7 @@ function generateForRow(sheet, row, config) {
     HP_PO: ['HP_PO', 'HP PO'],
     HP_AKTUAL: ['HP_AKTUAL', 'HP AKTUAL', 'HP ACTUAL'],
     HC_AKTUAL: ['HC_AKTUAL', 'HC AKTUAL', 'HC ACTUAL'],
-    HP_PENGAJUAN: ['HP_PENGAJUAN', 'HP PENGAJUAN']
+    HP_PENGAJUAN: ['HP_PENGAJUAN', 'HP PENGAJUAN', 'HP']
   };
 
   const escapeRegex = function (s) {
@@ -943,39 +1050,10 @@ function generateForRow(sheet, row, config) {
 
   replaceAliasesMerged_(body, ALIASES, data, escapeRegex);
 
-  // 2b. Isi placeholder tanggal hari ini (Bahasa Indonesia) — dihitung
-  //     saat dokumen dibuat, bukan dari data sheet. Aman untuk semua
-  //     template; kalau template tidak punya placeholder ini, dilewati.
-  const HARI_ID = ['Senin', 'Selasa', 'Rabu', 'Kamis', "Jum'at", 'Sabtu', 'Minggu'];
-  const BULAN_ID = ['Januari', 'Februari', 'Maret', 'April', 'Mei', 'Juni',
-    'Juli', 'Agustus', 'September', 'Oktober', 'November', 'Desember'];
-  const now = new Date();
-  const tz = Session.getScriptTimeZone();
-  const dateAliases = {
-    HARI_SEKARANG: ['HARI SEKARANG'],
-    TANGGAL_SEKARANG: ['TANGGAL SEKARANG'],
-    BULAN_SEKARANG: ['BULAN SEKARANG'],
-    TAHUN_SEKARANG: ['TAHUN SEKARANG']
-  };
-  const dateValues = {
-    HARI_SEKARANG: HARI_ID[Number(Utilities.formatDate(now, tz, 'u')) - 1],
-    TANGGAL_SEKARANG: Utilities.formatDate(now, tz, 'd'),
-    BULAN_SEKARANG: BULAN_ID[Number(Utilities.formatDate(now, tz, 'M')) - 1],
-    TAHUN_SEKARANG: Utilities.formatDate(now, tz, 'yyyy')
-  };
-  Object.keys(dateAliases).forEach(function (key) {
-    dateAliases[key].forEach(function (name) {
-      const pattern = '\\{\\{?' + escapeRegex(name) + '\\}?\\}';
-      body.replaceText(pattern, String(dateValues[key]));
-    });
-  });
-
-  // Rekatkan "TANGGAL BULAN TAHUN" (mis. "2 September 2026") pakai spasi
-  // non-breaking, supaya Google Docs tidak pernah memotongnya jadi 2
-  // baris gara-gara lebar paragraf tanda tangan yang sempit.
-  const dateGluedFrom_ = dateValues.TANGGAL_SEKARANG + ' ' + dateValues.BULAN_SEKARANG + ' ' + dateValues.TAHUN_SEKARANG;
-  const dateGluedTo_ = dateValues.TANGGAL_SEKARANG + '\u00A0' + dateValues.BULAN_SEKARANG + '\u00A0' + dateValues.TAHUN_SEKARANG;
-  body.replaceText(escapeRegex(dateGluedFrom_), dateGluedTo_);
+  // 2b. Isi placeholder tanggal (hari ini + 30 hari setelahnya).
+  //     Logika dipusatkan di fillDatePlaceholders_() supaya semua
+  //     template (SPK/BA/BB Percepatan) memakai aturan yang sama.
+  fillDatePlaceholders_(body, escapeRegex);
 
   doc.saveAndClose();
 
@@ -1362,38 +1440,10 @@ function generateBBPercepatanForGroup_(sheet, config, groupKeyValue) {
 
   replaceAliasesMerged_(body, ALIASES, data, escapeRegex);
 
-  // Placeholder tanggal hari ini, sama seperti config lainnya.
-  const HARI_ID = ['Senin', 'Selasa', 'Rabu', 'Kamis', "Jum'at", 'Sabtu', 'Minggu'];
-  const BULAN_ID = ['Januari', 'Februari', 'Maret', 'April', 'Mei', 'Juni',
-    'Juli', 'Agustus', 'September', 'Oktober', 'November', 'Desember'];
-  const now = new Date();
-  const tz = Session.getScriptTimeZone();
-  const dateAliases = {
-    HARI_SEKARANG: ['HARI SEKARANG'],
-    TANGGAL_SEKARANG: ['TANGGAL SEKARANG'],
-    BULAN_SEKARANG: ['BULAN SEKARANG'],
-    TAHUN_SEKARANG: ['TAHUN SEKARANG']
-  };
-  const dateValues = {
-    HARI_SEKARANG: HARI_ID[Number(Utilities.formatDate(now, tz, 'u')) - 1],
-    TANGGAL_SEKARANG: Utilities.formatDate(now, tz, 'd'),
-    BULAN_SEKARANG: BULAN_ID[Number(Utilities.formatDate(now, tz, 'M')) - 1],
-    TAHUN_SEKARANG: Utilities.formatDate(now, tz, 'yyyy')
-  };
-  Object.keys(dateAliases).forEach(function (key) {
-    dateAliases[key].forEach(function (name) {
-      const pattern = '\\{\\{?' + escapeRegex(name) + '\\}?\\}';
-      body.replaceText(pattern, String(dateValues[key]));
-    });
-  });
-
-  // Rekatkan "TANGGAL BULAN TAHUN" (mis. "2 September 2026") pakai spasi
-  // non-breaking, supaya Google Docs tidak pernah memotongnya jadi 2
-  // baris (mis. "2 September" di baris 1, "2026" sendirian di baris 2)
-  // gara-gara lebar paragraf tanda tangan yang sempit.
-  const dateGluedFrom_ = dateValues.TANGGAL_SEKARANG + ' ' + dateValues.BULAN_SEKARANG + ' ' + dateValues.TAHUN_SEKARANG;
-  const dateGluedTo_ = dateValues.TANGGAL_SEKARANG + '\u00A0' + dateValues.BULAN_SEKARANG + '\u00A0' + dateValues.TAHUN_SEKARANG;
-  body.replaceText(escapeRegex(dateGluedFrom_), dateGluedTo_);
+  // 2b. Isi placeholder tanggal (hari ini + 30 hari setelahnya).
+  //     Logika dipusatkan di fillDatePlaceholders_() supaya semua
+  //     template (SPK/BA/BB Percepatan) memakai aturan yang sama.
+  fillDatePlaceholders_(body, escapeRegex);
 
 
 
@@ -1493,7 +1543,8 @@ const DOC_TYPE_FETCHERS_ = [
   { label: 'Ekspand', fetch: function () { return getDocumentsForConfig_(EKSPAND, 'Ekspand'); } },
   { label: 'Pembatalan PO', fetch: function () { return getDocumentsForConfig_(PEMBATALAN, 'Pembatalan PO'); } },
   { label: 'BB Percepatan', fetch: function () { return getDocumentsForBBPercepatan_(BBPERCEPATAN, 'BB Percepatan'); } },
-  { label: 'BA Cancel One on One', fetch: function () { return getDocumentsForConfig_(BACANCEL, 'BA Cancel One on One'); } }
+  { label: 'BA Cancel One on One', fetch: function () { return getDocumentsForConfig_(BACANCEL, 'BA Cancel One on One'); } },
+  { label: 'Inner City', fetch: function () { return getDocumentsForConfig_(INNERCITY, 'Inner City'); } }
 ];
 
 function invalidateDocsCache_() {
@@ -1524,6 +1575,7 @@ function getConfigByType_(typeLabel) {
     case 'Pembatalan PO': return PEMBATALAN;
     case 'BB Percepatan': return BBPERCEPATAN;
     case 'BA Cancel One on One': return BACANCEL;
+    case 'Inner City': return INNERCITY;
     default: return null;
   }
 }
@@ -1596,6 +1648,9 @@ function handleApiRequest_(action, params) {
         break;
       case 'deleteDashboardDocument':
         result = deleteDashboardDocument(params.items || []);
+        break;
+      case 'cekExportWord':
+        result = cekExportWord_();
         break;
       default:
         return jsonOutput_({ error: 'Action tidak dikenal: ' + action });
@@ -2167,6 +2222,29 @@ function exportDocAsDocxBlob_(fileId, baseName) {
   throw new Error('Export Word gagal (' + lastErr + ')');
 }
 
+// Label jenis dokumen untuk nama file ZIP.
+const ZIP_TYPE_LABELS_ = {
+  'Takeover': 'TAKEOVER',
+  'New': 'NEW',
+  'Ekspand': 'EKSPAND',
+  'Pembatalan PO': 'PEMBATALAN PO',
+  'BB Percepatan': 'BB PERCEPATAN',
+  'BA Cancel One on One': 'BA ONE ON ONE',
+  'Inner City': 'INNER CITY'
+};
+
+function buildZipName_(items) {
+  const labels = [];
+  (items || []).forEach(function (it) {
+    const l = ZIP_TYPE_LABELS_[it.type] || (it.type ? String(it.type).toUpperCase() : '');
+    if (l && labels.indexOf(l) === -1) labels.push(l);
+  });
+  const dateStr = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'MMddyyyy');
+  let name = (labels.length ? 'SPK ' + labels.join('_') : 'SPK Dokumen') + '_' + dateStr;
+  name = name.replace(/[\\\/:*?"<>|]/g, '-');
+  return name + '.zip';
+}
+
 function downloadSelectedZip(items, format) {
   if (!items || items.length === 0) {
     throw new Error('Tidak ada dokumen yang dipilih.');
@@ -2210,8 +2288,9 @@ function downloadSelectedZip(items, format) {
       (failed.length ? ' Penyebab: ' + failed[0] : ''));
   }
 
-  const zipName = 'SPK_Dokumen_' +
-    Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyyMMdd_HHmmss') + '.zip';
+  // Nama ZIP mengikuti jenis dokumen yang diunduh, contoh:
+  // "SPK EKSPAND_NEW_BA ONE ON ONE_10082026.zip" (tanggal format MMddyyyy)
+  const zipName = buildZipName_(items);
   const zipBlob = Utilities.zip(blobs, zipName);
 
   return {
@@ -2223,26 +2302,32 @@ function downloadSelectedZip(items, format) {
   };
 }
 
-// Jalankan SEKALI dari editor Apps Script (pilih fungsi ini di dropdown ->
-// klik Run) untuk memberi izin "UrlFetchApp" (script.external_request) yang
-// dibutuhkan ekspor Word. Tidak perlu isi ID apa pun: fungsi ini otomatis
-// memakai Google Doc pertama yang ditemukan di folder Word Takeover.
-// Kalau muncul jendela "Authorization required" -> Review permissions ->
-// pilih akun -> Advanced -> Go to ... (unsafe) -> Allow.
-// Hasil tes bisa dilihat di Execution log: "Export Word OK ...".
-function tesExportWord() {
-  const folders = [TAKEOVER, SPKNEW, EKSPAND, PEMBATALAN, BACANCEL, BBPERCEPATAN];
-  for (let i = 0; i < folders.length; i++) {
-    const it = DriveApp.getFolderById(folders[i].OUTPUT_FOLDER_WORD_ID).getFiles();
+// Tes ekspor Word memakai Google Doc pertama yang ditemukan di salah satu
+// folder Word. Dipakai oleh tesExportWord() (dijalankan dari editor) dan oleh
+// endpoint ?action=cekExportWord (dibuka dari browser) -- yang kedua
+// menguji web app YANG SEDANG DI-DEPLOY, bukan kode di editor, jadi cocok
+// untuk memastikan deployment sudah memakai kode + izin terbaru.
+// Kalau gagal, fungsi ini melempar error berisi penyebabnya.
+const EXPORT_WORD_CODE_VERSION_ = 'export-word-v2';
+function cekExportWord_() {
+  const configs = [TAKEOVER, SPKNEW, EKSPAND, PEMBATALAN, BACANCEL, INNERCITY, BBPERCEPATAN];
+  for (let i = 0; i < configs.length; i++) {
+    const it = DriveApp.getFolderById(configs[i].OUTPUT_FOLDER_WORD_ID).getFiles();
     while (it.hasNext()) {
       const f = it.next();
       if (f.getMimeType() !== MimeType.GOOGLE_DOCS) continue;
       const blob = exportDocAsDocxBlob_(f.getId(), f.getName());
-      Logger.log('Export Word OK: ' + blob.getName() + ' (' + blob.getBytes().length + ' bytes)');
-      return;
+      return { ok: true, versi: EXPORT_WORD_CODE_VERSION_, file: blob.getName(), bytes: blob.getBytes().length };
     }
   }
-  Logger.log('Izin sudah OK, tapi belum ada Google Doc hasil generate di folder Word untuk dites.');
+  return { ok: true, versi: EXPORT_WORD_CODE_VERSION_, catatan: 'Izin OK, tapi belum ada Google Doc hasil generate untuk dites.' };
+}
+
+// Jalankan dari editor Apps Script (pilih fungsi ini -> Run). Hasilnya di
+// Execution log: "Export Word OK ...".
+function tesExportWord() {
+  const r = cekExportWord_();
+  Logger.log('Export Word OK: ' + JSON.stringify(r));
 }
 
 function uniqueBlobName_(blob, usedNames) {
