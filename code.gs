@@ -1445,7 +1445,14 @@ function generateBBPercepatanForGroup_(sheet, config, groupKeyValue) {
   //     template (SPK/BA/BB Percepatan) memakai aturan yang sama.
   fillDatePlaceholders_(body, escapeRegex);
 
-
+  // 2c. Isi tabel Lampiran (MITRA | SEGMENT | STASIUN): satu baris per
+  //     lokasi di grup ini. Sebelumnya fungsi ini tidak pernah dipanggil,
+  //     sehingga tabel lampiran tetap kosong.
+  try {
+    fillLampiranTable_(doc, group);
+  } catch (lampiranErr) {
+    Logger.log('generateBBPercepatanForGroup_: gagal mengisi tabel Lampiran: ' + lampiranErr);
+  }
 
   doc.saveAndClose();
 
