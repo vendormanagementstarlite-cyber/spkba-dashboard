@@ -277,7 +277,11 @@ const INNERCITY = {
     ALAMAT: 8            // H
   },
   LAST_DATA_COL: 8,
-  FILE_PREFIX: 'SPK INNER CITY'
+  FILE_PREFIX: 'SPK INNER CITY',
+  // GROUPED_IC: baris dengan NO SPK sama DAN nama mitra (PT/CV) sama
+  // digabung jadi SATU dokumen. {{HP}} = jumlah HP semua baris di grup itu,
+  // dan tabel Lampiran (MITRA | REGION | SITE | HP) diisi satu baris per SITE.
+  GROUPED_IC: true
   // Tidak ada kolom output link di sheet ini, sama seperti SPK New/Ekspand.
 };
 
@@ -563,22 +567,19 @@ function fillLampiranTable_(doc, group) {
     const targetTable = target.table;
     const col = target.col;
 
-    // Buang semua baris data lama (selain header baris ke-0).
-    while (targetTable.getNumRows() > 1) {
-      targetTable.removeRow(1);
-    }
-
+    const dataRows = [];
     group.rows.forEach(function (r) {
       if (!r.segment && !r.stasiun) return; // lewati baris kosong
-      const newRow = targetTable.appendTableRow();
+      const cells = [];
       for (let c = 0; c < col.total; c++) {
-        const text = c === col.mitra ? String(group.kepada || '')
+        cells.push(c === col.mitra ? String(group.kepada || '')
           : c === col.segment ? String(r.segment || '')
           : c === col.stasiun ? String(r.stasiun || '')
-          : '';
-        newRow.appendTableCell(text);
+          : '');
       }
+      dataRows.push(cells);
     });
+    fillTableRowsKeepFormat_(targetTable, dataRows);
   });
 
   Logger.log('fillLampiranTable_: berhasil mengisi ' + targets.length + ' tabel Lampiran.');
@@ -738,7 +739,8 @@ function onEditInstallable(e) {
       if (editedCol === BACANCEL.COL.NO_SPK) warnIfDuplicateNoSpkOnEdit_(sheet, row, BACANCEL.COL.NO_SPK, 'NO SPK');
     } else if (sheet.getName() === INNERCITY.SHEET_NAME) {
       if (editedCol > INNERCITY.LAST_DATA_COL) return;
-      if (editedCol === INNERCITY.COL.NO_SPK) warnIfDuplicateNoSpkOnEdit_(sheet, row, INNERCITY.COL.NO_SPK, 'NO SPK');
+      // NO SPK yang sama di beberapa baris SENGAJA diperbolehkan di Inner City
+      // (digabung jadi satu dokumen), jadi tidak ada peringatan dobel di sini.
     } else if (sheet.getName() === BBPERCEPATAN.SHEET_NAME) {
       if (editedCol > BBPERCEPATAN.LAST_DATA_COL) return;
       if (editedCol === BBPERCEPATAN.COL.NO_SPK_SURVEY) warnIfDuplicateNoSpkOnEditBBPercepatan_(sheet, BBPERCEPATAN, row, BBPERCEPATAN.COL.NO_SPK_SURVEY, 'NO SPK SURVEY');
@@ -810,10 +812,54 @@ function generateAllMissing_BACancel() {
 // MENU MANUAL — SPK INNER CITY
 // ======================================================================
 function generateActiveRow_InnerCity() {
-  runGenerateActiveRow(INNERCITY);
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(INNERCITY.SHEET_NAME);
+  if (!sheet) {
+    SpreadsheetApp.getUi().alert('Tab "' + INNERCITY.SHEET_NAME + '" tidak ditemukan.');
+    return;
+  }
+  if (SpreadsheetApp.getActiveSheet().getSheetId() !== sheet.getSheetId()) {
+    SpreadsheetApp.getUi().alert('Pindah dulu ke tab "' + INNERCITY.SHEET_NAME + '", klik baris datanya, baru jalankan menu ini lagi.');
+    return;
+  }
+  const row = sheet.getActiveCell().getRow();
+  if (row < FIRST_DATA_ROW) {
+    SpreadsheetApp.getUi().alert('Pilih salah satu baris data (bukan header).');
+    return;
+  }
+  const group = findInnerCityGroupByRow_(sheet, INNERCITY, row);
+  if (!group) {
+    SpreadsheetApp.getUi().alert('Baris ' + row + ' belum lengkap / tidak ditemukan dalam daftar dokumen Inner City.');
+    return;
+  }
+  const label = group.kepada + ' (SPK ' + group.noSpk + ', ' + group.rows.length + ' lokasi)';
+  const ok = generateInnerCityForGroup_(sheet, INNERCITY, group.key);
+  if (ok === true) {
+    invalidateDocsCache_();
+    SpreadsheetApp.getUi().alert('Dokumen berhasil dibuat: ' + label);
+  } else if (ok === false) {
+    SpreadsheetApp.getUi().alert('Data untuk ' + label + ' belum lengkap, dokumen belum dibuat.');
+  } else {
+    SpreadsheetApp.getUi().alert('Gagal membuat dokumen ' + label + ':\n\n' + ok);
+  }
 }
 function generateAllMissing_InnerCity() {
-  runGenerateAllMissing(INNERCITY);
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(INNERCITY.SHEET_NAME);
+  if (!sheet) {
+    SpreadsheetApp.getUi().alert('Tab "' + INNERCITY.SHEET_NAME + '" tidak ditemukan.');
+    return;
+  }
+  let wordMap = {};
+  try {
+    wordMap = buildFileMap_(DriveApp.getFolderById(INNERCITY.OUTPUT_FOLDER_WORD_ID));
+  } catch (err) { /* kosong -> semua dianggap belum dibuat */ }
+  let count = 0;
+  buildInnerCityGroups_(sheet, INNERCITY).forEach(function (group) {
+    if (!group.isComplete) return;
+    if (wordMap[buildInnerCityFileName_(group)]) return; // sudah ada
+    if (generateInnerCityForGroup_(sheet, INNERCITY, group.key) === true) count++;
+  });
+  if (count > 0) invalidateDocsCache_();
+  SpreadsheetApp.getUi().alert(count + ' dokumen Inner City berhasil dibuat.');
 }
 
 // ======================================================================
@@ -1486,6 +1532,286 @@ function generateBBPercepatanForGroup_(sheet, config, groupKeyValue) {
   return true;
 }
 
+
+// ======================================================================
+// INTI INNER CITY: gabungkan baris dengan NO SPK sama + mitra (PT/CV) sama
+// jadi SATU dokumen.
+//  - {{HP}} / {{HP PENGAJUAN}} = JUMLAH HP dari semua baris di grup itu.
+//  - Tabel Lampiran (header MITRA | REGION | SITE | HP) diisi satu baris
+//    per SITE, berapa pun jumlahnya (bukan cuma sebanyak baris template).
+//  - Dua baris dengan NO SPK sama tapi mitra beda = dua dokumen terpisah.
+// ======================================================================
+
+// Ubah isi sel HP (angka / teks "1.250" / "1,250" / "1250 HP") jadi bilangan bulat.
+function parseHp_(v) {
+  if (typeof v === 'number') return isFinite(v) ? Math.round(v) : 0;
+  const digits = String(v === null || v === undefined ? '' : v).replace(/[^\d]/g, '');
+  return digits ? parseInt(digits, 10) : 0;
+}
+
+function formatHp_(n) {
+  return String(n).replace(/\B(?=(\d{3})+(?!\d))/g, '.');
+}
+
+function buildInnerCityGroups_(sheet, config) {
+  const lastRow = sheet.getLastRow();
+  if (lastRow < FIRST_DATA_ROW) return [];
+  const values = sheet.getRange(FIRST_DATA_ROW, 1, lastRow - FIRST_DATA_ROW + 1, config.LAST_DATA_COL).getValues();
+  const COL = config.COL;
+  const get = function (row, colIndex) { return colIndex ? row[colIndex - 1] : ''; };
+  const trim = function (v) { return String(v === null || v === undefined ? '' : v).trim(); };
+
+  const byKey = {};
+  const order = [];
+  values.forEach(function (row, idx) {
+    const noSpk = trim(get(row, COL.NO_SPK));
+    const kepada = trim(get(row, COL.NAMA_MITRA_PT_CV));
+    if (!noSpk || !kepada) return; // baris belum lengkap -> lewati
+    const key = normalizeNoSpk_(noSpk) + '||' + kepada.toUpperCase();
+    if (!byKey[key]) {
+      byKey[key] = {
+        key: key, noSpk: noSpk, kepada: kepada,
+        mitraLama: trim(get(row, COL.MITRA_TANPA_PTCV)),
+        direksi: trim(get(row, COL.DIREKSI)),
+        alamat: trim(get(row, COL.ALAMAT)),
+        rows: [], rowNumbers: [], regions: [], totalHp: 0
+      };
+      order.push(key);
+    }
+    const g = byKey[key];
+    if (!g.direksi) g.direksi = trim(get(row, COL.DIREKSI));
+    if (!g.alamat) g.alamat = trim(get(row, COL.ALAMAT));
+    const region = trim(get(row, COL.REGION));
+    const hp = parseHp_(get(row, COL.HP_PENGAJUAN));
+    g.rows.push({ region: region, site: trim(get(row, COL.STASIUN)), hp: hp, rowNumber: FIRST_DATA_ROW + idx });
+    g.rowNumbers.push(FIRST_DATA_ROW + idx);
+    if (region && g.regions.indexOf(region) === -1) g.regions.push(region);
+    g.totalHp += hp;
+  });
+
+  return order.map(function (k) {
+    const g = byKey[k];
+    g.region = g.regions.join(', ');
+    g.isComplete = !!(g.kepada && g.noSpk && g.direksi && g.alamat && g.rows.some(function (r) { return r.site; }));
+    return g;
+  });
+}
+
+// Nama file HARUS sama persis antara generate & pemindaian dashboard.
+function buildInnerCityFileName_(group) {
+  const noSpkStr = String(group.noSpk);
+  const awal = noSpkStr.indexOf('/') !== -1 ? noSpkStr.substring(0, noSpkStr.indexOf('/')) : noSpkStr;
+  return INNERCITY.FILE_PREFIX + '_' + awal + '_' + group.kepada;
+}
+
+function findInnerCityGroup_(sheet, config, groupKeyValue) {
+  const groups = buildInnerCityGroups_(sheet, config);
+  const key = String(groupKeyValue);
+  for (let i = 0; i < groups.length; i++) if (groups[i].key === key) return groups[i];
+  return null;
+}
+
+function findInnerCityGroupByRow_(sheet, config, row) {
+  const groups = buildInnerCityGroups_(sheet, config);
+  for (let i = 0; i < groups.length; i++) if (groups[i].rowNumbers.indexOf(row) !== -1) return groups[i];
+  return null;
+}
+
+// Isi tabel Lampiran Inner City: header MITRA | REGION | SITE (atau STASIUN) | HP.
+function fillInnerCityLampiran_(doc, group) {
+  const body = doc.getBody();
+  let filled = 0;
+  for (let i = 0; i < body.getNumChildren(); i++) {
+    const child = body.getChild(i);
+    if (child.getType() !== DocumentApp.ElementType.TABLE) continue;
+    const table = child.asTable();
+    if (table.getNumRows() === 0) continue;
+    const header = table.getRow(0);
+    const n = header.getNumCells();
+    let cMitra = -1, cRegion = -1, cSite = -1, cHp = -1;
+    for (let c = 0; c < n; c++) {
+      const text = header.getCell(c).getText().trim().toUpperCase();
+      if (cMitra === -1 && text.indexOf('MITRA') !== -1) cMitra = c;
+      else if (cRegion === -1 && text.indexOf('REGION') !== -1) cRegion = c;
+      else if (cSite === -1 && (text.indexOf('SITE') !== -1 || text.indexOf('STASIUN') !== -1)) cSite = c;
+      else if (cHp === -1 && (text === 'HP' || text.indexOf('HP ') === 0 || text.indexOf('HOMEPASS') !== -1)) cHp = c;
+    }
+    if (cSite === -1 || cHp === -1) continue; // bukan tabel lampiran Inner City
+
+    const dataRows = [];
+    group.rows.forEach(function (r) {
+      if (!r.site) return;
+      const cells = [];
+      for (let c = 0; c < n; c++) {
+        cells.push(c === cMitra ? group.kepada
+          : c === cRegion ? r.region
+          : c === cSite ? r.site
+          : c === cHp ? formatHp_(r.hp)
+          : '');
+      }
+      dataRows.push(cells);
+    });
+    fillTableRowsKeepFormat_(table, dataRows);
+    filled++;
+  }
+  if (filled === 0) {
+    Logger.log('fillInnerCityLampiran_: tidak ketemu tabel dengan header SITE + HP di template Inner City. Lampiran tidak terisi.');
+  }
+}
+
+// Ganti semua baris data (selain header) dengan baris-baris baru. Kalau
+// template punya minimal 1 baris contoh di bawah header, baris itu dipakai
+// sebagai cetakan supaya border/perataan/font baris tambahan SAMA dengan
+// template, berapa pun jumlah barisnya.
+function fillTableRowsKeepFormat_(table, rows) {
+  const proto = table.getNumRows() > 1 ? table.getRow(1).copy() : null;
+  while (table.getNumRows() > 1) table.removeRow(1);
+  rows.forEach(function (cells) {
+    if (proto) {
+      const newRow = table.appendTableRow(proto.copy());
+      for (let c = 0; c < cells.length && c < newRow.getNumCells(); c++) {
+        newRow.getCell(c).setText(String(cells[c]));
+      }
+    } else {
+      const newRow = table.appendTableRow();
+      cells.forEach(function (text) { newRow.appendTableCell(String(text)); });
+    }
+  });
+}
+
+function generateInnerCityForGroup_(sheet, config, groupKeyValue) {
+  const group = findInnerCityGroup_(sheet, config, groupKeyValue);
+  if (!group || !group.isComplete) return false;
+
+  const wordFolder = withRetry_(function () { return DriveApp.getFolderById(config.OUTPUT_FOLDER_WORD_ID); }, 3, 'getFolderById WORD (Inner City)');
+  const pdfFolder = withRetry_(function () { return DriveApp.getFolderById(config.OUTPUT_FOLDER_PDF_ID); }, 3, 'getFolderById PDF (Inner City)');
+  const fileName = buildInnerCityFileName_(group);
+
+  const templateFile = withRetry_(function () { return DriveApp.getFileById(config.TEMPLATE_ID); }, 3, 'getFileById TEMPLATE (Inner City)');
+  const newDocFile = withRetry_(function () { return templateFile.makeCopy(fileName, wordFolder); }, 3, 'makeCopy (Inner City)');
+
+  let doc, body;
+  try {
+    doc = DocumentApp.openById(newDocFile.getId());
+    body = doc.getBody();
+  } catch (err) {
+    newDocFile.setTrashed(true);
+    return 'Template "' + config.TEMPLATE_ID + '" tidak bisa dibuka sebagai Google Docs. ' +
+      'Kemungkinan besar masih format Word (.docx). Simpan sebagai Google Dokumen lalu ganti TEMPLATE_ID. (Pesan asli: ' + err + ')';
+  }
+
+  const sites = group.rows.map(function (r) { return r.site; }).filter(function (s) { return s; });
+  const data = {
+    NO_SPK: group.noSpk,
+    KEPADA: group.kepada,
+    STASIUN: sites.join(', '),
+    REGION: group.region,
+    DIREKSI: group.direksi,
+    ALAMAT: group.alamat,
+    MITRA_LAMA: group.mitraLama,
+    HP_PENGAJUAN: formatHp_(group.totalHp)
+  };
+  const ALIASES = {
+    NO_SPK: ['NO_SPK', 'NO SPK'],
+    KEPADA: ['KEPADA', 'NAMA MITRA PAKAI PT/CV'],
+    STASIUN: ['STASIUN', 'SITE'],
+    REGION: ['REGION'],
+    DIREKSI: ['DIREKSI'],
+    ALAMAT: ['ALAMAT'],
+    MITRA_LAMA: ['MITRA_LAMA', 'MITRA LAMA', 'MITRA TANPA PT/CV'],
+    HP_PENGAJUAN: ['HP_PENGAJUAN', 'HP PENGAJUAN', 'HP']
+  };
+  const escapeRegex = function (s) { return s.replace(/[.*+?^${}()|[\]\\\/]/g, '\\$&'); };
+  replaceAliasesMerged_(body, ALIASES, data, escapeRegex);
+  fillDatePlaceholders_(body, escapeRegex);
+
+  try {
+    fillInnerCityLampiran_(doc, group);
+  } catch (lampiranErr) {
+    Logger.log('generateInnerCityForGroup_: gagal mengisi tabel Lampiran: ' + lampiranErr);
+  }
+
+  doc.saveAndClose();
+
+  const pdfFile = withRetry_(function () {
+    const pdfBlob = newDocFile.getAs(MimeType.PDF).setName(fileName + '.pdf');
+    return pdfFolder.createFile(pdfBlob);
+  }, 3, 'export PDF (Inner City)');
+
+  try {
+    withRetry_(function () {
+      newDocFile.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+      pdfFile.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+    }, 3, 'setSharing (Inner City)');
+  } catch (sharingErr) {
+    Logger.log('generateInnerCityForGroup_: setSharing gagal, dilewati: ' + sharingErr);
+  }
+
+  invalidateDocsCache_();
+  return true;
+}
+
+function getDocumentsForInnerCity_(config, typeLabel) {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(config.SHEET_NAME);
+  if (!sheet) return [];
+  const groups = buildInnerCityGroups_(sheet, config);
+  if (groups.length === 0) return [];
+
+  let wordMap, pdfMap;
+  try {
+    wordMap = buildFileMap_(DriveApp.getFolderById(config.OUTPUT_FOLDER_WORD_ID));
+    pdfMap = buildFileMap_(DriveApp.getFolderById(config.OUTPUT_FOLDER_PDF_ID));
+  } catch (err) {
+    return [];
+  }
+
+  const tz = Session.getScriptTimeZone();
+  const results = [];
+  groups.forEach(function (group) {
+    if (!group.isComplete) return;
+    const fileName = buildInnerCityFileName_(group);
+    const wordFile = wordMap[fileName] || null;
+    const pdfFile = pdfMap[fileName + '.pdf'] || null;
+    const createdDateObj = wordFile ? wordFile.getDateCreated() : (pdfFile ? pdfFile.getDateCreated() : null);
+    results.push({
+      type: typeLabel,
+      groupKey: group.key,
+      rowNumber: group.rowNumbers[0],
+      rowNumbers: group.rowNumbers,
+      noSpk: group.noSpk,
+      noPo: group.rows.length + ' lokasi · ' + formatHp_(group.totalHp) + ' HP',
+      kepada: group.kepada,
+      stasiun: group.rows.map(function (r) { return r.site; }).join(', '),
+      region: group.region,
+      fileName: fileName,
+      status: (wordFile || pdfFile) ? 'Sudah Dibuat' : 'Belum Dibuat',
+      createdDate: createdDateObj ? Utilities.formatDate(createdDateObj, tz, 'dd MMM yyyy, HH:mm') : null,
+      createdDateSort: createdDateObj ? createdDateObj.getTime() : 0,
+
+      wordFileId: wordFile ? wordFile.getId() : null,
+      pdfFileId: pdfFile ? pdfFile.getId() : null,
+
+      wordViewUrl: wordFile ? wordFile.getUrl() : null,
+      wordPreviewUrl: wordFile ? ('https://docs.google.com/document/d/' + wordFile.getId() + '/preview') : null,
+      wordDownloadUrl: wordFile ? ('https://docs.google.com/document/d/' + wordFile.getId() + '/export?format=docx') : null,
+
+      pdfViewUrl: pdfFile ? pdfFile.getUrl() : null,
+      pdfPreviewUrl: pdfFile ? ('https://drive.google.com/file/d/' + pdfFile.getId() + '/preview') : null,
+      pdfDownloadUrl: pdfFile ? ('https://drive.google.com/uc?export=download&id=' + pdfFile.getId()) : null
+    });
+  });
+  return results;
+}
+
+// Pengarah generik untuk jenis dokumen yang satu dokumennya mewakili banyak baris.
+function isGroupedConfig_(config) { return !!(config.GROUPED || config.GROUPED_IC); }
+function findGroupForConfig_(sheet, config, key) {
+  return config.GROUPED_IC ? findInnerCityGroup_(sheet, config, key) : findBBPercepatanGroup_(sheet, config, key);
+}
+function generateGroupForConfig_(sheet, config, key) {
+  return config.GROUPED_IC ? generateInnerCityForGroup_(sheet, config, key) : generateBBPercepatanForGroup_(sheet, config, key);
+}
+
 /**
  * ======================================================================
  * TAMBAHAN UNTUK WEB APP — SPK DASHBOARD (LENGKAP)
@@ -1551,7 +1877,7 @@ const DOC_TYPE_FETCHERS_ = [
   { label: 'Pembatalan PO', fetch: function () { return getDocumentsForConfig_(PEMBATALAN, 'Pembatalan PO'); } },
   { label: 'BB Percepatan', fetch: function () { return getDocumentsForBBPercepatan_(BBPERCEPATAN, 'BB Percepatan'); } },
   { label: 'BA Cancel One on One', fetch: function () { return getDocumentsForConfig_(BACANCEL, 'BA Cancel One on One'); } },
-  { label: 'Inner City', fetch: function () { return getDocumentsForConfig_(INNERCITY, 'Inner City'); } }
+  { label: 'Inner City', fetch: function () { return getDocumentsForInnerCity_(INNERCITY, 'Inner City'); } }
 ];
 
 function invalidateDocsCache_() {
@@ -1981,20 +2307,20 @@ function generateDashboardRow(typeLabel, rowNumber, groupKey) {
   const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(config.SHEET_NAME);
   if (!sheet) throw new Error('Tab "' + config.SHEET_NAME + '" tidak ditemukan.');
 
-  if (config.GROUPED) {
-    const group = findBBPercepatanGroup_(sheet, config, groupKey);
+  if (isGroupedConfig_(config)) {
+    const group = findGroupForConfig_(sheet, config, groupKey);
     if (access.allowedRegions && group) {
       if (access.allowedRegions.indexOf(group.region) === -1) {
         throw new Error('Anda tidak memiliki akses ke region "' + group.region + '".');
       }
     }
-    const result = generateBBPercepatanForGroup_(sheet, config, groupKey);
+    const result = generateGroupForConfig_(sheet, config, groupKey);
     if (result === true) {
       logGenerateAction_(typeLabel, groupKey, access.email);
       invalidateDocsCache_();
       return { success: true };
     } else if (result === false) {
-      return { success: false, message: 'Data untuk mitra pembangunan ini belum lengkap, dokumen belum dibuat.' };
+      return { success: false, message: 'Data untuk dokumen ini belum lengkap, dokumen belum dibuat.' };
     } else {
       return { success: false, message: String(result) };
     }
@@ -2069,16 +2395,16 @@ function generateDashboardBatch(items) {
         return;
       }
 
-      if (config.GROUPED) {
+      if (isGroupedConfig_(config)) {
         if (access.allowedRegions) {
-          const group = findBBPercepatanGroup_(sheet, config, item.groupKey);
+          const group = findGroupForConfig_(sheet, config, item.groupKey);
           if (group && access.allowedRegions.indexOf(group.region) === -1) {
             failCount++;
             messages.push(label + ': tidak ada akses region "' + group.region + '".');
             return;
           }
         }
-        const result = generateBBPercepatanForGroup_(sheet, config, item.groupKey);
+        const result = generateGroupForConfig_(sheet, config, item.groupKey);
         if (result === true) {
           successCount++;
           logGenerateAction_(item.type, item.groupKey, access.email);
@@ -2181,7 +2507,7 @@ function deleteDashboardDocument(items) {
       }
 
       // Bersihkan link lama di sheet, kalau tab ini punya kolom link.
-      if (!config.GROUPED && item.rowNumber && (config.COL.DOKUMEN_WORD || config.COL.DOKUMEN_PDF)) {
+      if (!isGroupedConfig_(config) && item.rowNumber && (config.COL.DOKUMEN_WORD || config.COL.DOKUMEN_PDF)) {
         let sheet = sheetCache[config.SHEET_NAME];
         if (!sheet) {
           sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(config.SHEET_NAME);
