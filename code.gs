@@ -1872,15 +1872,23 @@ function buildAllDocsFresh_() {
 
 function getAllDocsCached_() {
   const cache = CacheService.getScriptCache();
-  let all = [];
 
-  DOC_TYPE_FETCHERS_.forEach(function (t) {
-    const key = DOCS_CACHE_PREFIX + t.label;
+  // PERCEPATAN: baca ketujuh key cache dalam SATU panggilan (getAll),
+  // bukan 7 panggilan get() terpisah. Perilakunya sama persis: jenis yang
+  // ada di cache dipakai langsung, jenis yang tidak ada di-scan dari Drive.
+  const keys = DOC_TYPE_FETCHERS_.map(function (t) { return DOCS_CACHE_PREFIX + t.label; });
+  let cachedMap = {};
+  try { cachedMap = cache.getAll(keys) || {}; } catch (err) { cachedMap = {}; }
+
+  const perType = [];
+  const toStore = {};
+
+  DOC_TYPE_FETCHERS_.forEach(function (t, i) {
+    const key = keys[i];
     let docsForType = null;
 
     try {
-      const cached = cache.get(key);
-      if (cached) docsForType = JSON.parse(cached);
+      if (cachedMap[key]) docsForType = JSON.parse(cachedMap[key]);
     } catch (err) {
       // cache rusak/tidak terbaca -> lanjut ambil fresh seperti biasa
     }
@@ -1888,17 +1896,27 @@ function getAllDocsCached_() {
     if (!docsForType) {
       docsForType = t.fetch();
       try {
-        cache.put(key, JSON.stringify(docsForType), DOCS_CACHE_SECONDS);
-      } catch (err) {
-        // Data jenis ini masih kebesaran untuk 1 key cache -> tidak
-        // masalah, dashboard tetap jalan normal, hanya jenis ini yang
-        // akan discan ulang tiap load (jenis lain tetap ke-cache).
-      }
+        const serialized = JSON.stringify(docsForType);
+        // Batas CacheService ~100KB per key; yang kebesaran dilewati saja
+        // (jenis itu akan discan ulang tiap load, jenis lain tetap ke-cache).
+        if (serialized.length < 95000) toStore[key] = serialized;
+      } catch (err) { /* abaikan */ }
     }
 
-    all = all.concat(docsForType);
+    perType.push(docsForType);
   });
 
+  // Simpan semua hasil scan baru sekaligus (satu panggilan putAll).
+  if (Object.keys(toStore).length > 0) {
+    try {
+      cache.putAll(toStore, DOCS_CACHE_SECONDS);
+    } catch (err) {
+      // Gagal simpan cache tidak masalah -- dashboard tetap jalan normal.
+    }
+  }
+
+  let all = [];
+  perType.forEach(function (docs) { all = all.concat(docs); });
   return all;
 }
 
@@ -2251,27 +2269,78 @@ function downloadSelectedZip(items, format) {
   }
   format = format || 'both';
 
+  const wantWord = (format === 'word' || format === 'both');
+  const wantPdf = (format === 'pdf' || format === 'both');
+
   const blobs = [];
   const usedNames = {};
   const failed = []; // pesan kegagalan per file -> dikirim balik ke dashboard
 
-  items.forEach(function (item) {
-    if ((format === 'word' || format === 'both') && item.wordFileId) {
-      let wordName = item.wordFileId;
-      try {
-        const wordFile = DriveApp.getFileById(item.wordFileId);
-        wordName = wordFile.getName();
-        const blob = withRetry_(function () {
-          return exportDocAsDocxBlob_(item.wordFileId, wordName);
-        }, 2, 'export Word');
-        blobs.push(uniqueBlobName_(blob, usedNames));
-      } catch (err) {
-        failed.push('Word "' + wordName + '": ' + err);
-        Logger.log('downloadSelectedZip: gagal ambil Word ' + wordName + ' -> ' + err);
+  // ---- WORD: semua dokumen diekspor PARALEL lewat UrlFetchApp.fetchAll ----
+  // Sebelumnya ekspor Word dilakukan satu per satu (tiap dokumen menunggu
+  // dokumen sebelumnya selesai). Sekarang semua permintaan dikirim
+  // bersamaan; kalau ada yang gagal, dicoba ulang lewat jalur lama
+  // (exportDocAsDocxBlob_ + withRetry_) sehingga hasil akhirnya sama.
+  const wordJobs = [];
+  if (wantWord) {
+    items.forEach(function (item) {
+      if (!item.wordFileId) return;
+      let wordName = item.wordName || '';
+      if (!wordName) {
+        try { wordName = DriveApp.getFileById(item.wordFileId).getName(); }
+        catch (err) { wordName = item.wordFileId; }
       }
+      wordJobs.push({ id: item.wordFileId, name: wordName });
+    });
+  }
+
+  if (wordJobs.length > 0) {
+    const token = ScriptApp.getOAuthToken();
+    const requests = wordJobs.map(function (j) {
+      return {
+        url: 'https://docs.google.com/document/d/' + encodeURIComponent(j.id) + '/export?format=docx',
+        headers: { Authorization: 'Bearer ' + token },
+        muteHttpExceptions: true,
+        followRedirects: true
+      };
+    });
+
+    let responses = [];
+    try {
+      responses = UrlFetchApp.fetchAll(requests);
+    } catch (err) {
+      Logger.log('downloadSelectedZip: fetchAll gagal, pakai jalur satu-satu -> ' + err);
+      responses = [];
     }
-    if ((format === 'pdf' || format === 'both') && item.pdfFileId) {
-      let pdfName = item.pdfFileId;
+
+    wordJobs.forEach(function (job, i) {
+      let blob = null;
+      try {
+        const resp = responses[i];
+        if (resp && resp.getResponseCode() === 200) {
+          blob = resp.getBlob().setName(job.name + '.docx');
+        }
+      } catch (err) { blob = null; }
+
+      if (!blob) {
+        try {
+          blob = withRetry_(function () {
+            return exportDocAsDocxBlob_(job.id, job.name);
+          }, 2, 'export Word');
+        } catch (err) {
+          failed.push('Word "' + job.name + '": ' + err);
+          Logger.log('downloadSelectedZip: gagal ambil Word ' + job.name + ' -> ' + err);
+        }
+      }
+      if (blob) blobs.push(uniqueBlobName_(blob, usedNames));
+    });
+  }
+
+  // ---- PDF: diambil apa adanya ----
+  if (wantPdf) {
+    items.forEach(function (item) {
+      if (!item.pdfFileId) return;
+      let pdfName = item.pdfName || item.pdfFileId;
       try {
         const pdfFile = DriveApp.getFileById(item.pdfFileId);
         pdfName = pdfFile.getName();
@@ -2280,8 +2349,8 @@ function downloadSelectedZip(items, format) {
         failed.push('PDF "' + pdfName + '": ' + err);
         Logger.log('downloadSelectedZip: gagal ambil PDF ' + pdfName + ' -> ' + err);
       }
-    }
-  });
+    });
+  }
 
   if (blobs.length === 0) {
     throw new Error('Tidak ada file yang berhasil diambil untuk di-zip.' +
