@@ -344,6 +344,18 @@
 
     @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } }
 
+    /* ---------- Desktop: hanya daftar dokumen yang di-scroll ---------- */
+    @media (min-width: 901px) {
+      .main { height: 100vh; overflow: hidden; }
+      .view { min-height: 0; overflow-y: auto; }
+      #viewDocs { overflow: hidden; }
+      #viewDocs .head, #viewDocs .cards { flex: none; }
+      #viewDocs .panel { display: flex; flex-direction: column; min-height: 360px; }
+      #viewDocs .panel-head, #viewDocs .pager { flex: none; }
+      #viewDocs .scroll-x { flex: 1 1 auto; min-height: 0; overflow: auto; }
+      #viewDocs .thead { position: sticky; top: 0; z-index: 2; }
+    }
+
     /* ---------- Tablet / HP ---------- */
     @media (max-width: 900px) {
       .side { position: static; height: auto; flex: 1 1 100%; margin: 16px 16px 0; align-self: stretch; }
@@ -1577,6 +1589,7 @@
     if (!b || b.disabled) return;
     S.page = Number(b.dataset.page);
     renderTable();
+    const sx = document.querySelector('#viewDocs .scroll-x'); if (sx) sx.scrollTop = 0;
     window.scrollTo({ top: 0, behavior: 'smooth' });
   });
   $('refreshBtn').addEventListener('click', function () { load(true); });
