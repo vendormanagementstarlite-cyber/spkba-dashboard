@@ -65,6 +65,38 @@ function replaceAliasesMerged_(body, aliases, data, escapeRegex) {
 
 
 // ----------------------------------------------------------------------
+// ALAMAT BERBARIS BANYAK: baris lanjutan harus sejajar dengan awal TEKS
+// alamat (tepat setelah ": "), bukan menjorok ke posisi lain.
+// Caranya: indent kiri paragraf "Alamat : ..." diset ke posisi awal teks
+// (ALAMAT_TEKS_INDENT_PT), baris pertama tetap mulai dari margin. Posisi
+// titik dua template ~108pt (1,5 inci), ditambah lebar ": " ~6pt = 114pt.
+// Kalau template Anda memakai posisi titik dua yang berbeda, ubah angka ini.
+// Berlaku untuk SEMUA jenis dokumen (dipanggil di tiap generator).
+// ----------------------------------------------------------------------
+const ALAMAT_TEKS_INDENT_PT = 114;
+
+function alignAlamatWrap_(body) {
+  try {
+    let found = body.findText('^\\s*Alamat');
+    while (found) {
+      const el = found.getElement();
+      let para = el.getParent();
+      while (para && para.getType() !== DocumentApp.ElementType.PARAGRAPH) para = para.getParent();
+      if (para) {
+        const p = para.asParagraph();
+        if (/^\s*Alamat[\s\t]*:/i.test(p.getText())) {
+          p.setIndentFirstLine(0);
+          p.setIndentStart(ALAMAT_TEKS_INDENT_PT);
+        }
+      }
+      found = body.findText('^\\s*Alamat', found);
+    }
+  } catch (err) {
+    Logger.log('alignAlamatWrap_ dilewati: ' + err);
+  }
+}
+
+// ----------------------------------------------------------------------
 // PLACEHOLDER TANGGAL — dipakai semua template.
 //   {{HARI SEKARANG}}      -> Jum'at
 //   {{TANGGAL SEKARANG}}   -> 25
@@ -1100,6 +1132,7 @@ function generateForRow(sheet, row, config) {
   //     Logika dipusatkan di fillDatePlaceholders_() supaya semua
   //     template (SPK/BA/BB Percepatan) memakai aturan yang sama.
   fillDatePlaceholders_(body, escapeRegex);
+  alignAlamatWrap_(body);
 
   doc.saveAndClose();
 
@@ -1490,6 +1523,7 @@ function generateBBPercepatanForGroup_(sheet, config, groupKeyValue) {
   //     Logika dipusatkan di fillDatePlaceholders_() supaya semua
   //     template (SPK/BA/BB Percepatan) memakai aturan yang sama.
   fillDatePlaceholders_(body, escapeRegex);
+  alignAlamatWrap_(body);
 
   // 2c. Isi tabel Lampiran (MITRA | SEGMENT | STASIUN): satu baris per
   //     lokasi di grup ini. Sebelumnya fungsi ini tidak pernah dipanggil,
@@ -1724,6 +1758,7 @@ function generateInnerCityForGroup_(sheet, config, groupKeyValue) {
   const escapeRegex = function (s) { return s.replace(/[.*+?^${}()|[\]\\\/]/g, '\\$&'); };
   replaceAliasesMerged_(body, ALIASES, data, escapeRegex);
   fillDatePlaceholders_(body, escapeRegex);
+  alignAlamatWrap_(body);
 
   try {
     fillInnerCityLampiran_(doc, group);
