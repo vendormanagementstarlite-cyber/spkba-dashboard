@@ -71,13 +71,13 @@ function replaceAliasesMerged_(body, aliases, data, escapeRegex) {
 // Caranya: indent kiri paragraf "Alamat : ..." dan "Nomor PO : ..." diset ke
 // posisi awal teks (LABEL_TEKS_INDENT_PT), baris pertama tetap mulai dari
 // margin. Titik dua template berada di tab 72pt (1 inci), ditambah lebar ": "
-// ~6pt, jadi teks mulai di ~79pt (diukur dari hasil generate SPK).
+// ~6pt, jadi teks mulai di ~78,5pt (diukur dari hasil generate SPK).
 // Kalau template lain memakai posisi titik dua yang berbeda, ubah angka ini.
 // Hanya paragraf berbentuk "<label> : <isi>" yang disentuh, sel tabel yang
 // hanya berisi label tanpa titik dua tidak terpengaruh.
 // Berlaku untuk SEMUA jenis dokumen (dipanggil di tiap generator).
 // ----------------------------------------------------------------------
-const LABEL_TEKS_INDENT_PT = 79;
+const LABEL_TEKS_INDENT_PT = 78.5;
 const ALAMAT_TEKS_INDENT_PT = LABEL_TEKS_INDENT_PT; // nama lama, dipertahankan
 
 function alignAlamatWrap_(body) {
@@ -1992,6 +1992,262 @@ function doPost(e) {
   return handleApiRequest_(body.action, body);
 }
 
+// ======================================================================
+// INPUT PO CANCEL
+// Sumber data  : GSheet "Monitoring FTTH Starlite (new)", sheet "Tracker New" (A:R)
+// Tujuan input : GSheet "Vendor Management", sheet "PO CANCELED"
+//                (header di baris 2, data mulai baris 3)
+// Alur: user mengetik NO PO -> lookupPoCancel() mencari di Tracker New
+// dan mengisi otomatis Mitra Lama, Region, Stasiun, PO Release, Tipe PO,
+// HP PO -> user melengkapi kolom manual -> savePoCancel() menulis ke
+// PO CANCELED. Kolom lain (B, C, U, V, Y dst.) TIDAK disentuh karena
+// terisi otomatis oleh rumus di sheet saat NO SPK (kolom T) terisi.
+// ======================================================================
+const PO_CANCEL = {
+  // ID file (bagian di antara /d/ dan /edit pada URL GSheet)
+  TARGET_SS_ID: '1ZFNCeJH9joQUb71IS14ZmITKAf1Q-T_WDzAjDLt2M_k', // Vendor Management
+  SOURCE_SS_ID: '1-Gwp2K7U_VAhZJg1rhIxe0jowIDpYlsjAwKztADZjJU', // Monitoring FTTH Starlite (new)
+  TARGET_SHEET: 'PO CANCELED',
+  SOURCE_SHEET: 'Tracker New',
+  DROPDOWN_SHEET: 'DROPDOWN',
+  HEADER_ROW: 2,        // baris header di PO CANCELED
+  FIRST_DATA_ROW: 3,    // baris data pertama
+  SOURCE_LAST_COL: 18,  // kolom A..R di Tracker New
+  // Kolom di PO CANCELED yang boleh diisi dari web (1 = A)
+  COL: {
+    INPUT_DATE: 1, KETERANGAN: 4, MITRA_LAMA: 5, REGION: 6, STASIUN: 7,
+    PO_LAMA: 8, PO_RELEASE: 9, TIPE_PO: 10, HP_PO: 11, HP_ACTUAL: 12,
+    HC_ACTUAL: 13, KLASIFIKASI: 14, NO_BA: 15, DOK_BA: 16, MAILING_BA: 17,
+    UPDATE_BA_SPK: 18, MITRA_PENGGANTI: 19, NO_SPK: 20,
+    STATUS_CANCEL: 23, REMARK_MAILING: 24
+  },
+  // Nama header di Tracker New (dicari berdasarkan nama; kalau tidak ketemu
+  // dipakai huruf kolom sebagai cadangan: A=1 ... R=18)
+  SRC: {
+    mitra:   { name: 'Mitra History',             fallback: 1 },
+    tipePo:  { name: 'PO Item',                   fallback: 7 },
+    hpPo:    { name: 'HP PO',                     fallback: 8 },
+    region:  { name: 'Regional',                  fallback: 9 },
+    stasiun: { name: 'Stasiun',                   fallback: 10 },
+    release: { name: 'DATE RILIS PO PEMBANGUNAN', fallback: 11 },
+    po:      { name: 'NO PO PEMBANGUNAN',         fallback: 12 }
+  }
+};
+
+function poNorm_(v) {
+  return String(v == null ? '' : v).replace(/\s+/g, ' ').trim().toUpperCase();
+}
+
+// "PT. Saputra Global" / "CV Abc" -> "Saputra Global"
+function stripBadanUsaha_(name) {
+  let s = String(name == null ? '' : name).replace(/\s+/g, ' ').trim();
+  for (let i = 0; i < 3; i++) {
+    const t = s.replace(/^(PT|CV)\b\.?\s*/i, '').trim();
+    if (t === s) break;
+    s = t;
+  }
+  return s;
+}
+
+// Angka gaya Indonesia: "1.024" / "1.024,5" / 1024 -> 1024 / 1024.5
+function poNum_(v) {
+  if (typeof v === 'number') return v;
+  let s = String(v == null ? '' : v).trim();
+  if (s === '') return '';
+  if (/^-?\d{1,3}(\.\d{3})+(,\d+)?$/.test(s)) s = s.replace(/\./g, '').replace(',', '.');
+  else if (/^-?\d+,\d+$/.test(s)) s = s.replace(',', '.');
+  const n = Number(s.replace(/[^\d.-]/g, ''));
+  return (s !== '' && !isNaN(n)) ? n : v;
+}
+
+function poFmtDate_(v) {
+  if (v instanceof Date && !isNaN(v)) {
+    return Utilities.formatDate(v, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+  }
+  return v == null ? '' : String(v).trim();
+}
+
+function poParseDate_(s) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(s || '').trim());
+  if (!m) return String(s || '').trim();
+  return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+}
+
+function poOpen_(id, label) {
+  try { return SpreadsheetApp.openById(id); }
+  catch (err) {
+    throw new Error('Tidak bisa membuka GSheet ' + label + '. Pastikan akun yang men-deploy script punya akses ke file itu. (' + err + ')');
+  }
+}
+
+// Cari nomor kolom di Tracker New berdasarkan nama header.
+function poSourceColumns_(sheet) {
+  const scan = Math.min(sheet.getLastRow(), 6);
+  const hdr = scan > 0 ? sheet.getRange(1, 1, scan, PO_CANCEL.SOURCE_LAST_COL).getValues() : [];
+  let headerRowIdx = -1;
+  for (let r = 0; r < hdr.length; r++) {
+    if (hdr[r].some(function (c) { return poNorm_(c) === poNorm_(PO_CANCEL.SRC.po.name); })) { headerRowIdx = r; break; }
+  }
+  const cols = {};
+  Object.keys(PO_CANCEL.SRC).forEach(function (k) {
+    const spec = PO_CANCEL.SRC[k];
+    let idx = -1;
+    if (headerRowIdx >= 0) {
+      idx = hdr[headerRowIdx].findIndex(function (c) { return poNorm_(c) === poNorm_(spec.name); });
+    }
+    cols[k] = idx >= 0 ? idx : spec.fallback - 1;
+  });
+  return { cols: cols, firstDataRow: (headerRowIdx >= 0 ? headerRowIdx + 2 : 2) };
+}
+
+// Cari PO di sheet Tracker New dan kembalikan data untuk diisi otomatis.
+function lookupPoCancel(po) {
+  const key = poNorm_(po);
+  if (!key) throw new Error('Nomor PO belum diisi.');
+  const src = poOpen_(PO_CANCEL.SOURCE_SS_ID, 'Monitoring FTTH Starlite (new)').getSheetByName(PO_CANCEL.SOURCE_SHEET);
+  if (!src) throw new Error('Sheet "' + PO_CANCEL.SOURCE_SHEET + '" tidak ditemukan di GSheet Monitoring FTTH.');
+  const info = poSourceColumns_(src);
+  const last = src.getLastRow();
+  const matches = [];
+  if (last >= info.firstDataRow) {
+    const rows = src.getRange(info.firstDataRow, 1, last - info.firstDataRow + 1, PO_CANCEL.SOURCE_LAST_COL).getValues();
+    for (let i = 0; i < rows.length; i++) {
+      if (poNorm_(rows[i][info.cols.po]) !== key) continue;
+      const r = rows[i];
+      matches.push({
+        sourceRow: info.firstDataRow + i,
+        po: String(r[info.cols.po]).trim(),
+        mitraAsli: String(r[info.cols.mitra] || '').trim(),
+        mitraLama: stripBadanUsaha_(r[info.cols.mitra]),
+        region: String(r[info.cols.region] || '').trim(),
+        stasiun: String(r[info.cols.stasiun] || '').trim(),
+        poRelease: poFmtDate_(r[info.cols.release]),
+        tipePo: String(r[info.cols.tipePo] == null ? '' : r[info.cols.tipePo]).trim(),
+        hpPo: poNum_(r[info.cols.hpPo])
+      });
+      if (matches.length >= 10) break;
+    }
+  }
+  const dup = poFindTargetRow_(key);
+  return { found: matches.length > 0, matches: matches, existingRow: dup };
+}
+
+// Baris di PO CANCELED yang sudah memuat PO ini (0 kalau belum ada).
+function poFindTargetRow_(poKey) {
+  const sh = poOpen_(PO_CANCEL.TARGET_SS_ID, 'Vendor Management').getSheetByName(PO_CANCEL.TARGET_SHEET);
+  if (!sh) throw new Error('Sheet "' + PO_CANCEL.TARGET_SHEET + '" tidak ditemukan.');
+  const last = sh.getLastRow();
+  if (last < PO_CANCEL.FIRST_DATA_ROW) return 0;
+  const vals = sh.getRange(PO_CANCEL.FIRST_DATA_ROW, PO_CANCEL.COL.PO_LAMA, last - PO_CANCEL.FIRST_DATA_ROW + 1, 1).getValues();
+  for (let i = 0; i < vals.length; i++) {
+    if (poNorm_(vals[i][0]) === poKey) return PO_CANCEL.FIRST_DATA_ROW + i;
+  }
+  return 0;
+}
+
+// Baris kosong pertama berikutnya: setelah baris terakhir yang kolom
+// INPUT DATE / MITRA LAMA / PO LAMA / NO SPK-nya terisi.
+function poNextRow_(sh) {
+  const last = sh.getLastRow();
+  const from = PO_CANCEL.FIRST_DATA_ROW;
+  if (last < from) return from;
+  const n = last - from + 1;
+  const C = PO_CANCEL.COL;
+  const a = sh.getRange(from, C.INPUT_DATE, n, 1).getValues();
+  const e = sh.getRange(from, C.MITRA_LAMA, n, 1).getValues();
+  const h = sh.getRange(from, C.PO_LAMA, n, 1).getValues();
+  let lastFilled = from - 1;
+  for (let i = n - 1; i >= 0; i--) {
+    if (String(a[i][0]).trim() || String(e[i][0]).trim() || String(h[i][0]).trim()) { lastFilled = from + i; break; }
+  }
+  return lastFilled + 1;
+}
+
+// Pilihan dropdown untuk form (Status Cancel PO dari sheet DROPDOWN kolom C,
+// serta nilai yang sudah pernah dipakai untuk Klasifikasi & Mitra Pengganti).
+function getPoCancelOptions() {
+  const ss = poOpen_(PO_CANCEL.TARGET_SS_ID, 'Vendor Management');
+  const out = { statusCancel: [], klasifikasi: [], mitraPengganti: [] };
+  const dd = ss.getSheetByName(PO_CANCEL.DROPDOWN_SHEET);
+  if (dd) {
+    const n = Math.max(dd.getLastRow() - 2, 0);
+    if (n > 0) {
+      out.statusCancel = dd.getRange(3, 3, n, 1).getValues()
+        .map(function (r) { return String(r[0]).trim(); }).filter(Boolean);
+    }
+  }
+  const sh = ss.getSheetByName(PO_CANCEL.TARGET_SHEET);
+  if (sh && sh.getLastRow() >= PO_CANCEL.FIRST_DATA_ROW) {
+    const n = sh.getLastRow() - PO_CANCEL.FIRST_DATA_ROW + 1;
+    const uniq = function (col) {
+      const seen = {}, list = [];
+      sh.getRange(PO_CANCEL.FIRST_DATA_ROW, col, n, 1).getValues().forEach(function (r) {
+        const v = String(r[0]).trim();
+        if (v && !seen[v.toUpperCase()]) { seen[v.toUpperCase()] = 1; list.push(v); }
+      });
+      return list.slice(0, 300);
+    };
+    out.klasifikasi = uniq(PO_CANCEL.COL.KLASIFIKASI);
+    out.mitraPengganti = uniq(PO_CANCEL.COL.MITRA_PENGGANTI);
+    if (!out.statusCancel.length) out.statusCancel = uniq(PO_CANCEL.COL.STATUS_CANCEL);
+  }
+  return out;
+}
+
+// Simpan satu PO ke PO CANCELED. data = isian form. timpa = true untuk
+// memperbarui baris PO yang sudah ada (kalau tidak, PO ganda ditolak).
+function savePoCancel(data, timpa) {
+  data = data || {};
+  const key = poNorm_(data.po);
+  if (!key) throw new Error('Nomor PO belum diisi.');
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(20000)) throw new Error('Sedang ada proses simpan lain. Coba lagi sebentar.');
+  try {
+    const sh = poOpen_(PO_CANCEL.TARGET_SS_ID, 'Vendor Management').getSheetByName(PO_CANCEL.TARGET_SHEET);
+    if (!sh) throw new Error('Sheet "' + PO_CANCEL.TARGET_SHEET + '" tidak ditemukan.');
+    const C = PO_CANCEL.COL;
+    const existing = poFindTargetRow_(key);
+    if (existing && !timpa) {
+      const err = new Error('PO ' + data.po + ' sudah ada di sheet PO CANCELED (baris ' + existing + ').');
+      err.duplicateRow = existing;
+      throw err;
+    }
+    const row = existing || poNextRow_(sh);
+    const t = function (v) { return v == null ? '' : String(v).trim(); };
+    const num = poNum_;
+
+    // A: INPUT DATE
+    sh.getRange(row, C.INPUT_DATE).setValue(t(data.inputDate) ? poParseDate_(data.inputDate) : new Date());
+    // D..T berurutan (B, C, U, V TIDAK ada di sini / dilewati)
+    const mid = [
+      t(data.keterangan),                                   // D
+      t(data.mitraLama),                                    // E
+      t(data.region),                                       // F
+      t(data.stasiun),                                      // G
+      t(data.po),                                           // H
+      t(data.poRelease) ? poParseDate_(data.poRelease) : '',// I
+      t(data.tipePo),                                       // J
+      num(data.hpPo),                                       // K
+      num(data.hpActual),                                   // L
+      num(data.hcActual),                                   // M
+      t(data.klasifikasi),                                  // N
+      t(data.noBa),                                         // O
+      t(data.dokBa),                                        // P
+      t(data.mailingBa),                                    // Q
+      t(data.updateBaSpk),                                  // R
+      t(data.mitraPengganti),                               // S
+      t(data.noSpk)                                         // T
+    ];
+    sh.getRange(row, C.KETERANGAN, 1, mid.length).setValues([mid]);
+    // W..X
+    sh.getRange(row, C.STATUS_CANCEL, 1, 2).setValues([[t(data.statusCancel), t(data.remarkMailing)]]);
+    SpreadsheetApp.flush();
+    return { row: row, updated: !!existing, po: t(data.po) };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
 // ----------------------------------------------------------------------
 // Router sederhana: memetakan nama "action" dari client ke fungsi backend
 // yang sudah ada, lalu membungkus hasilnya (atau error-nya) jadi JSON.
@@ -2023,6 +2279,15 @@ function handleApiRequest_(action, params) {
         break;
       case 'deleteDashboardDocument':
         result = deleteDashboardDocument(params.items || []);
+        break;
+      case 'lookupPoCancel':
+        result = lookupPoCancel(params.po);
+        break;
+      case 'getPoCancelOptions':
+        result = getPoCancelOptions();
+        break;
+      case 'savePoCancel':
+        result = savePoCancel(params.data || {}, !!params.timpa);
         break;
       case 'cekExportWord':
         result = cekExportWord_();
