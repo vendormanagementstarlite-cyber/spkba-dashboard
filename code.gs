@@ -65,31 +65,38 @@ function replaceAliasesMerged_(body, aliases, data, escapeRegex) {
 
 
 // ----------------------------------------------------------------------
-// ALAMAT BERBARIS BANYAK: baris lanjutan harus sejajar dengan awal TEKS
-// alamat (tepat setelah ": "), bukan menjorok ke posisi lain.
-// Caranya: indent kiri paragraf "Alamat : ..." diset ke posisi awal teks
-// (ALAMAT_TEKS_INDENT_PT), baris pertama tetap mulai dari margin. Posisi
-// titik dua template ~108pt (1,5 inci), ditambah lebar ": " ~6pt = 114pt.
-// Kalau template Anda memakai posisi titik dua yang berbeda, ubah angka ini.
+// BARIS LANJUTAN ALAMAT & NOMOR PO: kalau isinya lebih dari satu baris,
+// baris berikutnya harus sejajar dengan awal TEKS isian (tepat di bawah
+// huruf pertama setelah ": "), bukan kembali ke margin atau menjorok lebih jauh.
+// Caranya: indent kiri paragraf "Alamat : ..." dan "Nomor PO : ..." diset ke
+// posisi awal teks (LABEL_TEKS_INDENT_PT), baris pertama tetap mulai dari
+// margin. Titik dua template berada di tab 72pt (1 inci), ditambah lebar ": "
+// ~6pt, jadi teks mulai di ~79pt (diukur dari hasil generate SPK).
+// Kalau template lain memakai posisi titik dua yang berbeda, ubah angka ini.
+// Hanya paragraf berbentuk "<label> : <isi>" yang disentuh, sel tabel yang
+// hanya berisi label tanpa titik dua tidak terpengaruh.
 // Berlaku untuk SEMUA jenis dokumen (dipanggil di tiap generator).
 // ----------------------------------------------------------------------
-const ALAMAT_TEKS_INDENT_PT = 114;
+const LABEL_TEKS_INDENT_PT = 79;
+const ALAMAT_TEKS_INDENT_PT = LABEL_TEKS_INDENT_PT; // nama lama, dipertahankan
 
 function alignAlamatWrap_(body) {
   try {
-    let found = body.findText('^\\s*Alamat');
+    const labelRe = /^\s*(Alamat|Nomor\s*PO|No\.?\s*PO)[ \t]*:/i;
+    let found = body.findText('^\\s*(Alamat|Nomor\\s*PO|No\\.?\\s*PO)');
     while (found) {
       const el = found.getElement();
       let para = el.getParent();
       while (para && para.getType() !== DocumentApp.ElementType.PARAGRAPH) para = para.getParent();
       if (para) {
         const p = para.asParagraph();
-        if (/^\s*Alamat[\s\t]*:/i.test(p.getText())) {
+        // teks paragraf bisa memuat tab antara label dan titik dua
+        if (labelRe.test(p.getText().replace(/\t/g, ' '))) {
           p.setIndentFirstLine(0);
-          p.setIndentStart(ALAMAT_TEKS_INDENT_PT);
+          p.setIndentStart(LABEL_TEKS_INDENT_PT);
         }
       }
-      found = body.findText('^\\s*Alamat', found);
+      found = body.findText('^\\s*(Alamat|Nomor\\s*PO|No\\.?\\s*PO)', found);
     }
   } catch (err) {
     Logger.log('alignAlamatWrap_ dilewati: ' + err);
